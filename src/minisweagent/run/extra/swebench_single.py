@@ -20,7 +20,7 @@ from minisweagent.utils.log import logger
 
 app = typer.Typer(add_completion=False)
 
-DEFAULT_OUTPUT = global_config_dir / "last_swebench_single_run.traj.json"
+DEFAULT_OUTPUT = global_config_dir / "astropy-13398-mini.traj.json"
 
 
 # fmt: off
