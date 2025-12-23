@@ -503,7 +503,7 @@ def exec_code_file(file_path):
     }))
 
 
-def submit_patch():
+def submit():
     """
     执行提交命令并返回 git diff 的 patch 内容
 

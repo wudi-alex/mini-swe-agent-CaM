@@ -51,7 +51,7 @@ class InteractiveAgentCam(InteractiveAgent):
                 f"Could not extract function name from response. "
                 f"Expected format: def action(): ..."
             )
-        func_name = func_name_match.group(1)
+        func_name = func_name_match.group(1) if function_code != 'submit()' else None
 
         # 拼接完整代码：tools定义 + agent函数 + 函数调用
         full_code = f"{tools_code}\n\n{function_code}\n\n{func_name}()" if function_code != 'submit()' else f"{tools_code}\n\n{function_code}"
