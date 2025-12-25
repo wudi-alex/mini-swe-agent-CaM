@@ -1,0 +1,962 @@
+{
+  "info": {
+    "exit_status": "Submitted",
+    "submission": "diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py\nindex 61f88401ab..24219a5ee3 100644\n--- a/django/db/backends/base/schema.py\n+++ b/django/db/backends/base/schema.py\n@@ -407,6 +407,18 @@ class BaseDatabaseSchemaEditor:\n             model, columns, exclude=meta_constraint_names | meta_index_names,\n             **constraint_kwargs\n         )\n+        # If we're deleting an index, prefer a non-unique index when both a unique\n+        # constraint and an index exist on the same columns (some backends mark\n+        # unique constraints as indexed). Try narrowing by unique=False.\n+        if len(constraint_names) != 1 and constraint_kwargs.get('index') and 'unique' not in constraint_kwargs:\n+            narrowed_kwargs = dict(constraint_kwargs)\n+            narrowed_kwargs['unique'] = False\n+            narrowed = self._constraint_names(\n+                model, columns, exclude=meta_constraint_names | meta_index_names,\n+                **narrowed_kwargs\n+            )\n+            if len(narrowed) == 1:\n+                constraint_names = narrowed\n         if len(constraint_names) != 1:\n             raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n                 len(constraint_names),\ndiff --git a/repro_delete_index.py b/repro_delete_index.py\nnew file mode 100644\nindex 0000000000..5844e96be5\n--- /dev/null\n+++ b/repro_delete_index.py\n@@ -0,0 +1,49 @@\n+from django.db.backends.base.schema import BaseDatabaseSchemaEditor\n+from types import SimpleNamespace\n+\n+class DummyConnection:\n+    def __init__(self):\n+        pass\n+    def cursor(self):\n+        class Ctx:\n+            def __enter__(self_inner): return self_inner\n+            def __exit__(self_inner, exc_type, exc, tb): return False\n+        return Ctx()\n+    def introspection_get_constraints(self, table):\n+        return {}\n+    @property\n+    def introspection(self):\n+        class I:\n+            def get_constraints(inner, cursor, table):\n+                return {\n+                    'uniq_idx': {'columns': ['a','b'], 'unique': True, 'primary_key': False, 'index': False, 'check': False, 'foreign_key': False, 'type': None},\n+                    'normal_idx': {'columns': ['a','b'], 'unique': False, 'primary_key': False, 'index': True, 'check': False, 'foreign_key': False, 'type': None},\n+                }\n+        return I()\n+    def ops(self): pass\n+\n+class DummyEditor(BaseDatabaseSchemaEditor):\n+    sql_delete_index = \"DROP INDEX %(name)s ON %(table)s\"\n+    sql_delete_unique = \"ALTER TABLE %(table)s DROP CONSTRAINT %(name)s\"\n+    def execute(self, sql): print('EXECUTE:', sql)\n+\n+class Field:\n+    def __init__(self, column): self.column = column\n+\n+class Meta:\n+    def __init__(self):\n+        self.db_table = 't'\n+        self.constraints = []\n+        self.indexes = []\n+    def get_field(self, name): return Field(name)\n+\n+class Model:\n+    def __init__(self):\n+        self._meta = Meta()\n+\n+editor = DummyEditor(SimpleNamespace(connection=DummyConnection()))\n+try:\n+    editor._delete_composed_index(Model(), ['a','b'], {'index': True}, editor.sql_delete_index)\n+    print('OK')\n+except Exception as e:\n+    print('ERROR', type(e), e)\n\n",
+    "model_stats": {
+      "instance_cost": 0.013648299999999999,
+      "api_calls": 16
+    },
+    "mini_version": "1.17.3",
+    "config": {
+      "agent": {
+        "system_template": "You are an ultra token-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage. Each of your output is executable python code formated as follows.\n\n  <format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence to describe reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition_file(names: List[str]): tool used to find the file paths which the defines the function or class by names; \n2. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)]; try not to show comments, set show_comments=True only if you cannot understand code;\n3. code_replace(file_path: str, old_code:str, new_code: str): tool used to replace old code block with new_code block; usually used to replace buggy code with patch;\n4. code_insert(file_path: str, new_code: str, line_number: int): tool used to insert new code into file with the start line number; usually used to insert patch code;\n4. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path,  try not to show comments, set show_comments=True only if you cannot understand code;\n5. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code;\n6. save_code_to_file(code: str, file_path: str): tool used to save code to file_path, for example, creating testing scripts;\n7. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.\n",
+        "instance_template": "<pr_description>\nConsider the following PR description:\n{{task}}\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the codebase by finding and reading relevant files\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Test edge cases to ensure your fix is robust, make sure generate test script only once with complete thinking.\n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>\n",
+        "timeout_template": "The last action timed out and has been killed.\nThe output of the action was:\n{% if output | length < 10000 -%}\n<output>\n{{output}}\n</output>\n{%- else -%}\n<warning>Output was too long and has been truncated.</warning>\n<output_head>\n{{ output[:5000] }}\n</output_head>\n<elided_chars>{{ output | length - 10000 }} characters elided</elided_chars>\n<output_tail>\n{{ output[-5000:] }}\n</output_tail>\n{%- endif %}\nPlease try another command and make sure to avoid those requiring interactive input.\n",
+        "format_error_template": "Please always provide EXACTLY ONE action in triple backticks, found actions.\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).\n",
+        "action_observation_template": "<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n",
+        "action_regex": "```bash\\s*\\n(.*?)\\n```",
+        "step_limit": 100,
+        "cost_limit": 0.2
+      },
+      "model": {
+        "model_name": "openai/gpt-5-mini",
+        "model_kwargs": {},
+        "litellm_model_registry": null,
+        "set_cache_control": null,
+        "cost_tracking": "default"
+      },
+      "environment": {
+        "image": "docker.io/swebench/sweb.eval.x86_64.django_1776_django-12708:latest",
+        "cwd": "/testbed",
+        "env": {
+          "PAGER": "cat",
+          "MANPAGER": "cat",
+          "LESS": "-R",
+          "PIP_PROGRESS_BAR": "off",
+          "TQDM_DISABLE": "1"
+        },
+        "forward_env": [],
+        "timeout": 60,
+        "executable": "docker",
+        "run_args": [
+          "--rm"
+        ],
+        "container_timeout": "2h",
+        "pull_timeout": 120
+      },
+      "agent_type": "minisweagent.run.extra.swebench_cam.ProgressTrackingAgent",
+      "model_type": "minisweagent.models.litellm_model.LitellmModel",
+      "environment_type": "minisweagent.environments.docker_cam.DockerEnvironmentCam"
+    }
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an ultra token-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage. Each of your output is executable python code formated as follows.\n\n  <format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence to describe reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition_file(names: List[str]): tool used to find the file paths which the defines the function or class by names; \n2. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)]; try not to show comments, set show_comments=True only if you cannot understand code;\n3. code_replace(file_path: str, old_code:str, new_code: str): tool used to replace old code block with new_code block; usually used to replace buggy code with patch;\n4. code_insert(file_path: str, new_code: str, line_number: int): tool used to insert new code into file with the start line number; usually used to insert patch code;\n4. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path,  try not to show comments, set show_comments=True only if you cannot understand code;\n5. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code;\n6. save_code_to_file(code: str, file_path: str): tool used to save code to file_path, for example, creating testing scripts;\n7. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.",
+      "timestamp": 1766664299.9781535
+    },
+    {
+      "role": "user",
+      "content": "<pr_description>\nConsider the following PR description:\nMigration crashes deleting an index_together if there is a unique_together on the same fields\nDescription\n\t\nHappens with Django 1.11.10\nSteps to reproduce:\n1) Create models with 2 fields, add 2 same fields to unique_together and to index_together\n2) Delete index_together -> Fail\nIt will fail at django/db/backends/base/schema.py, line 378, in _delete_composed_index(), ValueError: Found wrong number (2) of constraints for as this one will find two constraints, the _uniq and the _idx one. No way to get out of this...\nThe worst in my case is that happened as I wanted to refactor my code to use the \"new\" (Dj 1.11) Options.indexes feature. I am actually not deleting the index, just the way it is declared in my code.\nI think there are 2 different points here:\n1) The deletion of index_together should be possible alone or made coherent (migrations side?) with unique_together\n2) Moving the declaration of an index should not result in an index re-creation\n\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the codebase by finding and reading relevant files\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Test edge cases to ensure your fix is robust, make sure generate test script only once with complete thinking.\n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>",
+      "timestamp": 1766664299.9786777
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Locate the schema function _delete_composed_index to inspect where the error originates.\n@bug_reproduction\ndef find_schema_delete_composed_index():\n    exec_bash_cmd(\"grep -nR \\\"def _delete_composed_index\\\" testbed || true\")\n    return exec_bash_cmd(\"grep -nR \\\"_delete_composed_index\\\" testbed || true\")",
+      "timestamp": 1766664318.37667,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeNPRS8JIeuAl5TQndAneaset2ur",
+          "created": 1766664299,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Locate the schema function _delete_composed_index to inspect where the error originates.\n@bug_reproduction\ndef find_schema_delete_composed_index():\n    exec_bash_cmd(\"grep -nR \\\"def _delete_composed_index\\\" testbed || true\")\n    return exec_bash_cmd(\"grep -nR \\\"_delete_composed_index\\\" testbed || true\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 471,
+            "prompt_tokens": 1570,
+            "total_tokens": 2041,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 384,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \nbash execution output:\n \n</output>",
+      "timestamp": 1766664318.6039999
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search codebase for references to index_together, unique_together, and composed index deletion to find relevant code.\n@bug_reproduction\ndef search_index_related_functions():\n    exec_bash_cmd(\"grep -nR \\\"index_together\\\" testbed || true\")\n    exec_bash_cmd(\"grep -nR \\\"unique_together\\\" testbed || true\")\n    return exec_bash_cmd(\"grep -nR \\\"composed_index\\\" testbed || true\")",
+      "timestamp": 1766664321.4699972,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeNiEwGIvYkadifxCMFYiVuRs0R2",
+          "created": 1766664318,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search codebase for references to index_together, unique_together, and composed index deletion to find relevant code.\n@bug_reproduction\ndef search_index_related_functions():\n    exec_bash_cmd(\"grep -nR \\\"index_together\\\" testbed || true\")\n    exec_bash_cmd(\"grep -nR \\\"unique_together\\\" testbed || true\")\n    return exec_bash_cmd(\"grep -nR \\\"composed_index\\\" testbed || true\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 171,
+            "prompt_tokens": 1683,
+            "total_tokens": 1854,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \nbash execution output:\n \nbash execution output:\n \n</output>",
+      "timestamp": 1766664321.6682346
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: List repository to find relevant Django-like schema code.\n@bug_reproduction\ndef list_repo_root():\n    return exec_bash_cmd(\"ls -R .\")",
+      "timestamp": 1766664323.7648635,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeNl3VrsraAi9riVf0topsCsMJFz",
+          "created": 1766664321,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: List repository to find relevant Django-like schema code.\n@bug_reproduction\ndef list_repo_root():\n    return exec_bash_cmd(\"ls -R .\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 44,
+            "prompt_tokens": 1821,
+            "total_tokens": 1865,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 0,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>1</returncode>\n<output>\nbash execution output:\n Traceback (most recent call last):\n  File \"<string>\", line 753, in <module>\n  File \"<string>\", line 699, in wrapper\n  File \"<string>\", line 751, in list_repo_root\n  File \"<string>\", line 642, in exec_bash_cmd\nUnicodeEncodeError: 'ascii' codec can't encode characters in position 207516-207518: ordinal not in range(128)\n</output>",
+      "timestamp": 1766664324.3740952
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search repo for '_delete_composed_index' and 'schema.py' with controlled output to avoid encoding issues.\n@bug_reproduction\ndef search_schema_files():\n    exec_bash_cmd(\"grep -nR \\\"_delete_composed_index\\\" || true\")\n    return exec_bash_cmd(\"grep -nR \\\"class DatabaseSchemaEditor\\\" || true\")",
+      "timestamp": 1766664329.205003,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeNnGKRbbqymtzUxDNXMG8XjxLud",
+          "created": 1766664323,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search repo for '_delete_composed_index' and 'schema.py' with controlled output to avoid encoding issues.\n@bug_reproduction\ndef search_schema_files():\n    exec_bash_cmd(\"grep -nR \\\"_delete_composed_index\\\" || true\")\n    return exec_bash_cmd(\"grep -nR \\\"class DatabaseSchemaEditor\\\" || true\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 212,
+            "prompt_tokens": 1974,
+            "total_tokens": 2186,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 128,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n django/db/backends/base/schema.py:380:            self._delete_composed_index(model, fields, {'unique': True}, self.sql_delete_unique)\ndjango/db/backends/base/schema.py:396:            self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)\ndjango/db/backends/base/schema.py:402:    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):\ndjango/db/backends/mysql/schema.py:115:    def _delete_composed_index(self, model, fields, *args):\ndjango/db/backends/mysql/schema.py:129:        return super()._delete_composed_index(model, fields, *args)\n\nbash execution output:\n django/db/backends/postgresql/schema.py:8:class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):\ndjango/db/backends/oracle/schema.py:9:class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):\ndjango/db/backends/sqlite3/schema.py:13:class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):\ndjango/db/backends/mysql/schema.py:5:class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):\n\n</output>",
+      "timestamp": 1766664330.6335776
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Show the _delete_composed_index implementation in base schema to inspect the bug.\n@bug_localization\ndef print_base_schema_context():\n    return print_code_context(\"django/db/backends/base/schema.py\", (360, 420))",
+      "timestamp": 1766664334.395949,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeNuhf1S3JZR3eSot9oUv3WL23Mp",
+          "created": 1766664330,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Show the _delete_composed_index implementation in base schema to inspect the bug.\n@bug_localization\ndef print_base_schema_context():\n    return print_code_context(\"django/db/backends/base/schema.py\", (360, 420))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 123,
+            "prompt_tokens": 2304,
+            "total_tokens": 2427,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 360         sql = constraint.create_sql(model, self)\n 361         if sql:\n 362             self.execute(sql)\n 363 \n 364     def remove_constraint(self, model, constraint):\n 366         sql = constraint.remove_sql(model, self)\n 367         if sql:\n 368             self.execute(sql)\n 369 \n 370     def alter_unique_together(self, model, old_unique_together, new_unique_together):\n 371         \"\"\"\n 372         Deal with a model changing its unique_together. The input\n 373         unique_togethers must be doubly-nested, not the single-nested\n 374         [\"foo\", \"bar\"] format.\n 376         olds = {tuple(fields) for fields in old_unique_together}\n 377         news = {tuple(fields) for fields in new_unique_together}\n 379         for fields in olds.difference(news):\n 380             self._delete_composed_index(model, fields, {'unique': True}, self.sql_delete_unique)\n 382         for fields in news.difference(olds):\n 383             columns = [model._meta.get_field(field).column for field in fields]\n 384             self.execute(self._create_unique_sql(model, columns))\n 385 \n 386     def alter_index_together(self, model, old_index_together, new_index_together):\n 387         \"\"\"\n 388         Deal with a model changing its index_together. The input\n 389         index_togethers must be doubly-nested, not the single-nested\n 390         [\"foo\", \"bar\"] format.\n 392         olds = {tuple(fields) for fields in old_index_together}\n 393         news = {tuple(fields) for fields in new_index_together}\n 395         for fields in olds.difference(news):\n 396             self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)\n 398         for field_names in news.difference(olds):\n 399             fields = [model._meta.get_field(field) for field in field_names]\n 400             self.execute(self._create_index_sql(model, fields, suffix=\"_idx\"))\n 401 \n 402     def _delete_composed_index(self, model, fields, constraint_kwargs, sql):\n 403         meta_constraint_names = {constraint.name for constraint in model._meta.constraints}\n 404         meta_index_names = {constraint.name for constraint in model._meta.indexes}\n 405         columns = [model._meta.get_field(field).column for field in fields]\n 406         constraint_names = self._constraint_names(\n 407             model, columns, exclude=meta_constraint_names | meta_index_names,\n 408             **constraint_kwargs\n 409         )\n 410         if len(constraint_names) != 1:\n 411             raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n 412                 len(constraint_names),\n 413                 model._meta.db_table,\n 414                 \", \".join(columns),\n 415             ))\n 416         self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))\n 417 \n 418     def alter_db_table(self, model, old_db_table, new_db_table):\n 420         if (old_db_table == new_db_table or\n</output>",
+      "timestamp": 1766664334.613035
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Find the implementation of _constraint_names to see how constraints are filtered.\n@bug_localization\ndef find_constraint_names():\n    return exec_bash_cmd(\"grep -nR \\\"def _constraint_names\\\" -n django || true\")",
+      "timestamp": 1766664338.964908,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeNykbrkkekEbFLreaWfQqxa7iF4",
+          "created": 1766664334,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Find the implementation of _constraint_names to see how constraints are filtered.\n@bug_localization\ndef find_constraint_names():\n    return exec_bash_cmd(\"grep -nR \\\"def _constraint_names\\\" -n django || true\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 251,
+            "prompt_tokens": 3065,
+            "total_tokens": 3316,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 192,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 2176,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n django/db/backends/base/schema.py:1142:    def _constraint_names(self, model, column_names=None, unique=None,\n\n</output>",
+      "timestamp": 1766664339.211395
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Display _constraint_names implementation to understand why both unique and index constraints are returned.\n@bug_localization\ndef print_constraint_names():\n    return print_code_context(\"django/db/backends/base/schema.py\", (1120, 1180))",
+      "timestamp": 1766664340.798346,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeO2VqPUGq1vrVGoroBe3gtt9zBw",
+          "created": 1766664338,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Display _constraint_names implementation to understand why both unique and index constraints are returned.\n@bug_localization\ndef print_constraint_names():\n    return print_code_context(\"django/db/backends/base/schema.py\", (1120, 1180))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 60,
+            "prompt_tokens": 3171,
+            "total_tokens": 3231,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 0,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 1792,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n1120             'name': self.quote_name(name),\n1121             'constraint': self.sql_check_constraint % {'check': check},\n1122         }\n1123 \n1124     def _create_check_sql(self, model, name, check):\n1125         return Statement(\n1126             self.sql_create_check,\n1127             table=Table(model._meta.db_table, self.quote_name),\n1128             name=self.quote_name(name),\n1129             check=check,\n1130         )\n1131 \n1132     def _delete_check_sql(self, model, name):\n1133         return self._delete_constraint_sql(self.sql_delete_check, model, name)\n1134 \n1135     def _delete_constraint_sql(self, template, model, name):\n1136         return Statement(\n1137             template,\n1138             table=Table(model._meta.db_table, self.quote_name),\n1139             name=self.quote_name(name),\n1140         )\n1141 \n1142     def _constraint_names(self, model, column_names=None, unique=None,\n1143                           primary_key=None, index=None, foreign_key=None,\n1144                           check=None, type_=None, exclude=None):\n1146         if column_names is not None:\n1147             column_names = [\n1148                 self.connection.introspection.identifier_converter(name)\n1149                 for name in column_names\n1150             ]\n1151         with self.connection.cursor() as cursor:\n1152             constraints = self.connection.introspection.get_constraints(cursor, model._meta.db_table)\n1153         result = []\n1154         for name, infodict in constraints.items():\n1155             if column_names is None or column_names == infodict['columns']:\n1156                 if unique is not None and infodict['unique'] != unique:\n1157                     continue\n1158                 if primary_key is not None and infodict['primary_key'] != primary_key:\n1159                     continue\n1160                 if index is not None and infodict['index'] != index:\n1161                     continue\n1162                 if check is not None and infodict['check'] != check:\n1163                     continue\n1164                 if foreign_key is not None and not infodict['foreign_key']:\n1165                     continue\n1166                 if type_ is not None and infodict['type'] != type_:\n1167                     continue\n1168                 if not exclude or name not in exclude:\n1169                     result.append(name)\n1170         return result\n1171 \n1172     def _delete_primary_key(self, model, strict=False):\n1173         constraint_names = self._constraint_names(model, primary_key=True)\n1174         if strict and len(constraint_names) != 1:\n1175             raise ValueError('Found wrong number (%s) of PK constraints for %s' % (\n1176                 len(constraint_names),\n1177                 model._meta.db_table,\n1178             ))\n1179         for constraint_name in constraint_names:\n1180             self.execute(self._delete_primary_key_sql(model, constraint_name))\n</output>",
+      "timestamp": 1766664341.0146832
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Patch _delete_composed_index to prefer non-unique indexes when deleting an index (index=True) to avoid matching unique constraint.\n@bug_localization\ndef patch_delete_composed_index():\n    old_code = \"\"\"    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):\n        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}\n        meta_index_names = {constraint.name for constraint in model._meta.indexes}\n        columns = [model._meta.get_field(field).column for field in fields]\n        constraint_names = self._constraint_names(\n            model, columns, exclude=meta_constraint_names | meta_index_names,\n            **constraint_kwargs\n        )\n        if len(constraint_names) != 1:\n            raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n                len(constraint_names),\n                model._meta.db_table,\n                \", \".join(columns),\n            ))\n        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))\"\"\"\n    new_code = \"\"\"    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):\n        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}\n        meta_index_names = {constraint.name for constraint in model._meta.indexes}\n        columns = [model._meta.get_field(field).column for field in fields]\n        constraint_names = self._constraint_names(\n            model, columns, exclude=meta_constraint_names | meta_index_names,\n            **constraint_kwargs\n        )\n        # If we're deleting an index, prefer a non-unique index when both a unique\n        # constraint and an index exist on the same columns (some backends mark\n        # unique constraints as indexed). Try narrowing by unique=False.\n        if len(constraint_names) != 1 and constraint_kwargs.get('index') and 'unique' not in constraint_kwargs:\n            narrowed_kwargs = dict(constraint_kwargs)\n            narrowed_kwargs['unique'] = False\n            narrowed = self._constraint_names(\n                model, columns, exclude=meta_constraint_names | meta_index_names,\n                **narrowed_kwargs\n            )\n            if len(narrowed) == 1:\n                constraint_names = narrowed\n        if len(constraint_names) != 1:\n            raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n                len(constraint_names),\n                model._meta.db_table,\n                \", \".join(columns),\n            ))\n        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))\"\"\"\n    return code_replace(\"django/db/backends/base/schema.py\", old_code, new_code)",
+      "timestamp": 1766664387.0687437,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeO494SsvTEnjyAS2RbAcHQ6zvtI",
+          "created": 1766664340,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Patch _delete_composed_index to prefer non-unique indexes when deleting an index (index=True) to avoid matching unique constraint.\n@bug_localization\ndef patch_delete_composed_index():\n    old_code = \"\"\"    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):\n        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}\n        meta_index_names = {constraint.name for constraint in model._meta.indexes}\n        columns = [model._meta.get_field(field).column for field in fields]\n        constraint_names = self._constraint_names(\n            model, columns, exclude=meta_constraint_names | meta_index_names,\n            **constraint_kwargs\n        )\n        if len(constraint_names) != 1:\n            raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n                len(constraint_names),\n                model._meta.db_table,\n                \", \".join(columns),\n            ))\n        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))\"\"\"\n    new_code = \"\"\"    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):\n        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}\n        meta_index_names = {constraint.name for constraint in model._meta.indexes}\n        columns = [model._meta.get_field(field).column for field in fields]\n        constraint_names = self._constraint_names(\n            model, columns, exclude=meta_constraint_names | meta_index_names,\n            **constraint_kwargs\n        )\n        # If we're deleting an index, prefer a non-unique index when both a unique\n        # constraint and an index exist on the same columns (some backends mark\n        # unique constraints as indexed). Try narrowing by unique=False.\n        if len(constraint_names) != 1 and constraint_kwargs.get('index') and 'unique' not in constraint_kwargs:\n            narrowed_kwargs = dict(constraint_kwargs)\n            narrowed_kwargs['unique'] = False\n            narrowed = self._constraint_names(\n                model, columns, exclude=meta_constraint_names | meta_index_names,\n                **narrowed_kwargs\n            )\n            if len(narrowed) == 1:\n                constraint_names = narrowed\n        if len(constraint_names) != 1:\n            raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n                len(constraint_names),\n                model._meta.db_table,\n                \", \".join(columns),\n            ))\n        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))\"\"\"\n    return code_replace(\"django/db/backends/base/schema.py\", old_code, new_code)",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1777,
+            "prompt_tokens": 3883,
+            "total_tokens": 5660,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 1216,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3072,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nReplaced\n</output>",
+      "timestamp": 1766664387.310514
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Run test suite to verify the change doesn't break existing tests and to reproduce the reported failure.\n@patch_verification\ndef run_pytest():\n    return exec_bash_cmd(\"pytest -q -k schema -q || true\")",
+      "timestamp": 1766664389.9598787,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeOon2tbU6lZiN7bAMHGZlt8PQf7",
+          "created": 1766664386,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Run test suite to verify the change doesn't break existing tests and to reproduce the reported failure.\n@patch_verification\ndef run_pytest():\n    return exec_bash_cmd(\"pytest -q -k schema -q || true\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 122,
+            "prompt_tokens": 4463,
+            "total_tokens": 4585,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3840,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \n</output>",
+      "timestamp": 1766664390.1708674
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Run full test suite to ensure no regressions.\n@patch_verification\ndef run_full_pytest():\n    return exec_bash_cmd(\"pytest -q || true\")",
+      "timestamp": 1766664392.5565374,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeOrDhkyRRJWGi8Ys775bwUXWyF6",
+          "created": 1766664389,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Run full test suite to ensure no regressions.\n@patch_verification\ndef run_full_pytest():\n    return exec_bash_cmd(\"pytest -q || true\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 46,
+            "prompt_tokens": 4542,
+            "total_tokens": 4588,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 0,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 2944,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \n</output>",
+      "timestamp": 1766664392.768481
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Create a small reproduction using the project's schema editor to simulate deleting index_together when unique_together exists and run it.\n@test_generation\ndef generate_and_run_repro():\n    code = \"\"\"from django.db.backends.base.schema import BaseDatabaseSchemaEditor\nfrom types import SimpleNamespace\n\nclass DummyConnection:\n    def __init__(self):\n        pass\n    def cursor(self):\n        class Ctx:\n            def __enter__(self_inner): return self_inner\n            def __exit__(self_inner, exc_type, exc, tb): return False\n        return Ctx()\n    def introspection_get_constraints(self, table):\n        return {}\n    @property\n    def introspection(self):\n        class I:\n            def get_constraints(inner, cursor, table):\n                return {\n                    'uniq_idx': {'columns': ['a','b'], 'unique': True, 'primary_key': False, 'index': False, 'check': False, 'foreign_key': False, 'type': None},\n                    'normal_idx': {'columns': ['a','b'], 'unique': False, 'primary_key': False, 'index': True, 'check': False, 'foreign_key': False, 'type': None},\n                }\n        return I()\n    def ops(self): pass\n\nclass DummyEditor(BaseDatabaseSchemaEditor):\n    sql_delete_index = \"DROP INDEX %(name)s ON %(table)s\"\n    sql_delete_unique = \"ALTER TABLE %(table)s DROP CONSTRAINT %(name)s\"\n    def execute(self, sql): print('EXECUTE:', sql)\n\nclass Field:\n    def __init__(self, column): self.column = column\n\nclass Meta:\n    def __init__(self):\n        self.db_table = 't'\n        self.constraints = []\n        self.indexes = []\n    def get_field(self, name): return Field(name)\n\nclass Model:\n    def __init__(self):\n        self._meta = Meta()\n\neditor = DummyEditor(SimpleNamespace(connection=DummyConnection()))\ntry:\n    editor._delete_composed_index(Model(), ['a','b'], {'index': True}, editor.sql_delete_index)\n    print('OK')\nexcept Exception as e:\n    print('ERROR', type(e), e)\n\"\"\"\n    save_code_to_file(code, \"repro_delete_index.py\")\n    return exec_bash_cmd(\"python3 repro_delete_index.py\")",
+      "timestamp": 1766664401.8249648,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeOudc4GrhdiXv0hLc1LLcOZi8GJ",
+          "created": 1766664392,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Create a small reproduction using the project's schema editor to simulate deleting index_together when unique_together exists and run it.\n@test_generation\ndef generate_and_run_repro():\n    code = \"\"\"from django.db.backends.base.schema import BaseDatabaseSchemaEditor\nfrom types import SimpleNamespace\n\nclass DummyConnection:\n    def __init__(self):\n        pass\n    def cursor(self):\n        class Ctx:\n            def __enter__(self_inner): return self_inner\n            def __exit__(self_inner, exc_type, exc, tb): return False\n        return Ctx()\n    def introspection_get_constraints(self, table):\n        return {}\n    @property\n    def introspection(self):\n        class I:\n            def get_constraints(inner, cursor, table):\n                return {\n                    'uniq_idx': {'columns': ['a','b'], 'unique': True, 'primary_key': False, 'index': False, 'check': False, 'foreign_key': False, 'type': None},\n                    'normal_idx': {'columns': ['a','b'], 'unique': False, 'primary_key': False, 'index': True, 'check': False, 'foreign_key': False, 'type': None},\n                }\n        return I()\n    def ops(self): pass\n\nclass DummyEditor(BaseDatabaseSchemaEditor):\n    sql_delete_index = \"DROP INDEX %(name)s ON %(table)s\"\n    sql_delete_unique = \"ALTER TABLE %(table)s DROP CONSTRAINT %(name)s\"\n    def execute(self, sql): print('EXECUTE:', sql)\n\nclass Field:\n    def __init__(self, column): self.column = column\n\nclass Meta:\n    def __init__(self):\n        self.db_table = 't'\n        self.constraints = []\n        self.indexes = []\n    def get_field(self, name): return Field(name)\n\nclass Model:\n    def __init__(self):\n        self._meta = Meta()\n\neditor = DummyEditor(SimpleNamespace(connection=DummyConnection()))\ntry:\n    editor._delete_composed_index(Model(), ['a','b'], {'index': True}, editor.sql_delete_index)\n    print('OK')\nexcept Exception as e:\n    print('ERROR', type(e), e)\n\"\"\"\n    save_code_to_file(code, \"repro_delete_index.py\")\n    return exec_bash_cmd(\"python3 repro_delete_index.py\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 551,
+            "prompt_tokens": 4609,
+            "total_tokens": 5160,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3968,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \n</output>",
+      "timestamp": 1766664402.2755005
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Display the reproduction script to verify its contents and debug silent execution.\n@test_generation\ndef show_repro_file():\n    return exec_bash_cmd(\"nl -ba repro_delete_index.py | sed -n '1,200p'\")",
+      "timestamp": 1766664409.4409118,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqeP38d1khVcn24Hn4FuzQUGHh8S9",
+          "created": 1766664401,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Display the reproduction script to verify its contents and debug silent execution.\n@test_generation\ndef show_repro_file():\n    return exec_bash_cmd(\"nl -ba repro_delete_index.py | sed -n '1,200p'\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 315,
+            "prompt_tokens": 5117,
+            "total_tokens": 5432,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 256,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3968,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n      1\tfrom django.db.backends.base.schema import BaseDatabaseSchemaEditor\n     2\tfrom types import SimpleNamespace\n     3\t\n     4\tclass DummyConnection:\n     5\t    def __init__(self):\n     6\t        pass\n     7\t    def cursor(self):\n     8\t        class Ctx:\n     9\t            def __enter__(self_inner): return self_inner\n    10\t            def __exit__(self_inner, exc_type, exc, tb): return False\n    11\t        return Ctx()\n    12\t    def introspection_get_constraints(self, table):\n    13\t        return {}\n    14\t    @property\n    15\t    def introspection(self):\n    16\t        class I:\n    17\t            def get_constraints(inner, cursor, table):\n    18\t                return {\n    19\t                    'uniq_idx': {'columns': ['a','b'], 'unique': True, 'primary_key': False, 'index': False, 'check': False, 'foreign_key': False, 'type': None},\n    20\t                    'normal_idx': {'columns': ['a','b'], 'unique': False, 'primary_key': False, 'index': True, 'check': False, 'foreign_key': False, 'type': None},\n    21\t                }\n    22\t        return I()\n    23\t    def ops(self): pass\n    24\t\n    25\tclass DummyEditor(BaseDatabaseSchemaEditor):\n    26\t    sql_delete_index = \"DROP INDEX %(name)s ON %(table)s\"\n    27\t    sql_delete_unique = \"ALTER TABLE %(table)s DROP CONSTRAINT %(name)s\"\n    28\t    def execute(self, sql): print('EXECUTE:', sql)\n    29\t\n    30\tclass Field:\n    31\t    def __init__(self, column): self.column = column\n    32\t\n    33\tclass Meta:\n    34\t    def __init__(self):\n    35\t        self.db_table = 't'\n    36\t        self.constraints = []\n    37\t        self.indexes = []\n    38\t    def get_field(self, name): return Field(name)\n    39\t\n    40\tclass Model:\n    41\t    def __init__(self):\n    42\t        self._meta = Meta()\n    43\t\n    44\teditor = DummyEditor(SimpleNamespace(connection=DummyConnection()))\n    45\ttry:\n    46\t    editor._delete_composed_index(Model(), ['a','b'], {'index': True}, editor.sql_delete_index)\n    47\t    print('OK')\n    48\texcept Exception as e:\n    49\t    print('ERROR', type(e), e)\n\n</output>",
+      "timestamp": 1766664409.6443744
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Execute the reproduction script to observe behavior.\n@patch_verification\ndef run_repro_script():\n    return exec_bash_cmd(\"python3 repro_delete_index.py\")",
+      "timestamp": 1766664413.051525,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqePBHm3cuC3hMG7OccEIHfVWxvkP",
+          "created": 1766664409,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Execute the reproduction script to observe behavior.\n@patch_verification\ndef run_repro_script():\n    return exec_bash_cmd(\"python3 repro_delete_index.py\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 173,
+            "prompt_tokens": 5757,
+            "total_tokens": 5930,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 128,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 4864,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \n</output>",
+      "timestamp": 1766664413.3892174
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Display the patched _delete_composed_index to confirm changes.\n@debug\ndef show_patched_delete_composed_index():\n    return print_code_context(\"django/db/backends/base/schema.py\", (396, 420))",
+      "timestamp": 1766664421.2333522,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqePEuKaBF6rMMtfcSRqhbyuAWtm9",
+          "created": 1766664412,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Display the patched _delete_composed_index to confirm changes.\n@debug\ndef show_patched_delete_composed_index():\n    return print_code_context(\"django/db/backends/base/schema.py\", (396, 420))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 504,
+            "prompt_tokens": 5823,
+            "total_tokens": 6327,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 448,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 4864,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 396             self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)\n 398         for field_names in news.difference(olds):\n 399             fields = [model._meta.get_field(field) for field in field_names]\n 400             self.execute(self._create_index_sql(model, fields, suffix=\"_idx\"))\n 401 \n 402     def _delete_composed_index(self, model, fields, constraint_kwargs, sql):\n 403         meta_constraint_names = {constraint.name for constraint in model._meta.constraints}\n 404         meta_index_names = {constraint.name for constraint in model._meta.indexes}\n 405         columns = [model._meta.get_field(field).column for field in fields]\n 406         constraint_names = self._constraint_names(\n 407             model, columns, exclude=meta_constraint_names | meta_index_names,\n 408             **constraint_kwargs\n 409         )\n 413         if len(constraint_names) != 1 and constraint_kwargs.get('index') and 'unique' not in constraint_kwargs:\n 414             narrowed_kwargs = dict(constraint_kwargs)\n 415             narrowed_kwargs['unique'] = False\n 416             narrowed = self._constraint_names(\n 417                 model, columns, exclude=meta_constraint_names | meta_index_names,\n 418                 **narrowed_kwargs\n 419             )\n 420             if len(narrowed) == 1:\n</output>",
+      "timestamp": 1766664421.4497592
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Show remaining lines of the function to confirm final logic and deletion call.\n@debug\ndef show_patched_delete_composed_index_continue():\n    return print_code_context(\"django/db/backends/base/schema.py\", (420, 444))",
+      "timestamp": 1766664423.8355553,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqePMsqnhIyqyfZc8T5QuW0nkmQXB",
+          "created": 1766664420,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Show remaining lines of the function to confirm final logic and deletion call.\n@debug\ndef show_patched_delete_composed_index_continue():\n    return print_code_context(\"django/db/backends/base/schema.py\", (420, 444))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 123,
+            "prompt_tokens": 6189,
+            "total_tokens": 6312,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 4864,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 420             if len(narrowed) == 1:\n 421                 constraint_names = narrowed\n 422         if len(constraint_names) != 1:\n 423             raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n 424                 len(constraint_names),\n 425                 model._meta.db_table,\n 426                 \", \".join(columns),\n 427             ))\n 428         self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))\n 429 \n 430     def alter_db_table(self, model, old_db_table, new_db_table):\n 432         if (old_db_table == new_db_table or\n 433             (self.connection.features.ignores_table_name_case and\n 434                 old_db_table.lower() == new_db_table.lower())):\n 435             return\n 436         self.execute(self.sql_rename_table % {\n 437             \"old_table\": self.quote_name(old_db_table),\n 438             \"new_table\": self.quote_name(new_db_table),\n 439         })\n 441         for sql in self.deferred_sql:\n 442             if isinstance(sql, Statement):\n 443                 sql.rename_table_references(old_db_table, new_db_table)\n 444 \n</output>",
+      "timestamp": 1766664424.0642698
+    },
+    {
+      "role": "assistant",
+      "content": "submit()",
+      "timestamp": 1766664431.3220012,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CqePPJNUsjljjou5jyq6dtpjGSquc",
+          "created": 1766664423,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "submit()",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 395,
+            "prompt_tokens": 6523,
+            "total_tokens": 6918,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 384,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 4480,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py\nindex 61f88401ab..24219a5ee3 100644\n--- a/django/db/backends/base/schema.py\n+++ b/django/db/backends/base/schema.py\n@@ -407,6 +407,18 @@ class BaseDatabaseSchemaEditor:\n             model, columns, exclude=meta_constraint_names | meta_index_names,\n             **constraint_kwargs\n         )\n+        # If we're deleting an index, prefer a non-unique index when both a unique\n+        # constraint and an index exist on the same columns (some backends mark\n+        # unique constraints as indexed). Try narrowing by unique=False.\n+        if len(constraint_names) != 1 and constraint_kwargs.get('index') and 'unique' not in constraint_kwargs:\n+            narrowed_kwargs = dict(constraint_kwargs)\n+            narrowed_kwargs['unique'] = False\n+            narrowed = self._constraint_names(\n+                model, columns, exclude=meta_constraint_names | meta_index_names,\n+                **narrowed_kwargs\n+            )\n+            if len(narrowed) == 1:\n+                constraint_names = narrowed\n         if len(constraint_names) != 1:\n             raise ValueError(\"Found wrong number (%s) of constraints for %s(%s)\" % (\n                 len(constraint_names),\ndiff --git a/repro_delete_index.py b/repro_delete_index.py\nnew file mode 100644\nindex 0000000000..5844e96be5\n--- /dev/null\n+++ b/repro_delete_index.py\n@@ -0,0 +1,49 @@\n+from django.db.backends.base.schema import BaseDatabaseSchemaEditor\n+from types import SimpleNamespace\n+\n+class DummyConnection:\n+    def __init__(self):\n+        pass\n+    def cursor(self):\n+        class Ctx:\n+            def __enter__(self_inner): return self_inner\n+            def __exit__(self_inner, exc_type, exc, tb): return False\n+        return Ctx()\n+    def introspection_get_constraints(self, table):\n+        return {}\n+    @property\n+    def introspection(self):\n+        class I:\n+            def get_constraints(inner, cursor, table):\n+                return {\n+                    'uniq_idx': {'columns': ['a','b'], 'unique': True, 'primary_key': False, 'index': False, 'check': False, 'foreign_key': False, 'type': None},\n+                    'normal_idx': {'columns': ['a','b'], 'unique': False, 'primary_key': False, 'index': True, 'check': False, 'foreign_key': False, 'type': None},\n+                }\n+        return I()\n+    def ops(self): pass\n+\n+class DummyEditor(BaseDatabaseSchemaEditor):\n+    sql_delete_index = \"DROP INDEX %(name)s ON %(table)s\"\n+    sql_delete_unique = \"ALTER TABLE %(table)s DROP CONSTRAINT %(name)s\"\n+    def execute(self, sql): print('EXECUTE:', sql)\n+\n+class Field:\n+    def __init__(self, column): self.column = column\n+\n+class Meta:\n+    def __init__(self):\n+        self.db_table = 't'\n+        self.constraints = []\n+        self.indexes = []\n+    def get_field(self, name): return Field(name)\n+\n+class Model:\n+    def __init__(self):\n+        self._meta = Meta()\n+\n+editor = DummyEditor(SimpleNamespace(connection=DummyConnection()))\n+try:\n+    editor._delete_composed_index(Model(), ['a','b'], {'index': True}, editor.sql_delete_index)\n+    print('OK')\n+except Exception as e:\n+    print('ERROR', type(e), e)\n\n",
+      "timestamp": 1766664431.7891254
+    }
+  ],
+  "trajectory_format": "mini-swe-agent-1",
+  "instance_id": "django__django-12708"
+}
