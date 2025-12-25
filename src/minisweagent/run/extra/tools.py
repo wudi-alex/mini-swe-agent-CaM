@@ -4,26 +4,85 @@ import subprocess
 import json
 import re
 import tempfile
+import sys
 
 
-def find_definition_file(names, search_path="."):
+# ===== Compatibility Helper Functions =====
+def get_node_end_lineno(node, source_lines):
     """
-    查找类或函数定义并打印结果
+    Get the end line number of an AST node (compatible with Python 3.6/3.7)
 
-    参数:
-        names: 要查找的类名或函数名列表
-        search_path: 搜索路径，默认为当前目录
+    Args:
+        node: AST node
+        source_lines: List of source code lines
 
-    输出格式: file_path name
+    Returns:
+        End line number (1-based)
     """
+    # Python 3.8+ has end_lineno attribute
+    if hasattr(node, 'end_lineno') and node.end_lineno is not None:
+        return node.end_lineno
+
+    # Python 3.6/3.7 needs manual calculation
+    # Search from start line downward until finding correct end position
+    start_line = node.lineno - 1  # Convert to 0-based
+
+    # For simple nodes, might be only one line
+    if not hasattr(node, 'body') or not node.body:
+        # Try to find where indentation decreases
+        if start_line >= len(source_lines):
+            return len(source_lines)
+
+        # Get indentation level of node start
+        start_indent = len(source_lines[start_line]) - len(source_lines[start_line].lstrip())
+
+        # Search downward until indentation decreases or file ends
+        current_line = start_line + 1
+        while current_line < len(source_lines):
+            line = source_lines[current_line]
+            if line.strip():  # Non-empty line
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= start_indent:
+                    return current_line  # 1-based
+            current_line += 1
+
+        return len(source_lines)
+
+    # For nodes with body (class, function, etc.), find last child node's end position
+    last_lineno = node.lineno
+    for child in ast.walk(node):
+        if hasattr(child, 'lineno') and child.lineno:
+            last_lineno = max(last_lineno, child.lineno)
+
+    # Search from last known line number downward for actual end position
+    start_indent = len(source_lines[start_line]) - len(source_lines[start_line].lstrip())
+    current_line = last_lineno
+
+    while current_line < len(source_lines):
+        line = source_lines[current_line]
+        if line.strip():  # Non-empty line
+            current_indent = len(line) - len(line.lstrip())
+            if current_indent <= start_indent and current_line > start_line:
+                return current_line  # 1-based
+        current_line += 1
+
+    return len(source_lines)
+
+
+def print_definition_file(names, search_path="."):
     for name in names:
         files = set()
 
-        # 搜索类定义
         cmd = ['grep', '-rl', '-E', f"^class\\s+{name}\\s*[:(]",
                search_path, '--include=*.py']
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                errors='replace',
+            )
             if result.returncode == 0 and result.stdout.strip():
                 files.update(result.stdout.strip().split('\n'))
         except:
@@ -32,7 +91,13 @@ def find_definition_file(names, search_path="."):
         cmd = ['grep', '-rl', '-E', f"^def\\s+{name}\\s*\\(",
                search_path, '--include=*.py']
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                errors='replace',
+            )
             if result.returncode == 0 and result.stdout.strip():
                 files.update(result.stdout.strip().split('\n'))
         except:
@@ -47,20 +112,9 @@ def find_definition_file(names, search_path="."):
 
 
 def print_definition(name_file_list, show_comments=False):
-    """
-    打印类或函数的定义代码
-
-    参数:
-        name_file_list: [(name, file_path), ...] 列表
-        show_comments: 是否显示注释，默认False
-
-    输出格式:
-        file_path name:
-        line_num: code
-    """
     for name, file_path in name_file_list:
         try:
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
                 lines = content.splitlines()
 
@@ -77,11 +131,10 @@ def print_definition(name_file_list, show_comments=False):
                 print()
 
         except Exception as e:
-            print(f"{file_path} {name}: error reading file\n")
+            print(f"{file_path} {name}: error reading file - {e}\n")
 
 
 def _find_definitions(tree, name):
-    """使用ast查找类或函数定义"""
     definitions = []
 
     for node in ast.walk(tree):
@@ -92,8 +145,17 @@ def _find_definitions(tree, name):
     return definitions
 
 
-def _get_docstring_lines(node):
-    """获取docstring所在的行号集合（递归处理嵌套的函数和类）"""
+def _get_docstring_lines(node, source_lines):
+    """
+    Get all docstring line numbers in the node
+
+    Args:
+        node: AST node
+        source_lines: List of source code lines
+
+    Returns:
+        Set of docstring line numbers (0-based)
+    """
     docstring_lines = set()
 
     if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -102,11 +164,9 @@ def _get_docstring_lines(node):
     if not node.body:
         return docstring_lines
 
-    # 检查第一个语句是否是docstring
     first_stmt = node.body[0]
     if isinstance(first_stmt, ast.Expr):
         value = first_stmt.value
-        # Python 3.8+ 使用 Constant，旧版本使用 Str
         is_docstring = False
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             is_docstring = True
@@ -114,27 +174,24 @@ def _get_docstring_lines(node):
             is_docstring = True
 
         if is_docstring:
-            # 添加docstring的所有行
-            for line_num in range(first_stmt.lineno - 1, first_stmt.end_lineno):
+            end_line = get_node_end_lineno(first_stmt, source_lines)
+            for line_num in range(first_stmt.lineno - 1, end_line):
                 docstring_lines.add(line_num)
 
-    # 递归处理body中的所有嵌套函数和类
     for item in node.body:
         if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            docstring_lines.update(_get_docstring_lines(item))
+            docstring_lines.update(_get_docstring_lines(item, source_lines))
 
     return docstring_lines
 
 
 def _print_code_with_lines(lines, node, show_comments):
-    """打印带行号的代码"""
     start_line = node.lineno - 1
-    end_line = node.end_lineno
+    end_line = get_node_end_lineno(node, lines)
 
-    # 获取docstring的行范围
     docstring_lines = set()
     if not show_comments:
-        docstring_lines = _get_docstring_lines(node)
+        docstring_lines = _get_docstring_lines(node, lines)
 
     for i in range(start_line, end_line):
         if i >= len(lines):
@@ -142,13 +199,10 @@ def _print_code_with_lines(lines, node, show_comments):
 
         line = lines[i]
 
-        # 过滤注释和docstring
         if not show_comments:
             stripped = line.strip()
-            # 跳过#注释
             if stripped.startswith('#'):
                 continue
-            # 跳过docstring行
             if i in docstring_lines:
                 continue
 
@@ -156,16 +210,6 @@ def _print_code_with_lines(lines, node, show_comments):
 
 
 def remove_comments_with_mapping(code):
-    """
-    Remove comments from Python code and create line mapping
-
-    Args:
-        code: Python code string
-
-    Returns:
-        Tuple of (code_no_comments, line_mapping)
-        line_mapping[i] = original line number for comment-free line i
-    """
     lines = code.split('\n')
     result_lines = []
     line_mapping = []
@@ -329,9 +373,11 @@ def code_replace(file_path, old_code, new_code):
     try:
         result = subprocess.run(
             ['python', '-m', 'py_compile', tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=10
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=10,
+            errors='replace',
         )
 
         if result.returncode != 0:
@@ -342,9 +388,11 @@ def code_replace(file_path, old_code, new_code):
         try:
             flake_result = subprocess.run(
                 ['pyflakes', tmp_path],
-                capture_output=True,
-                text=True,
-                timeout=10
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=10,
+                errors='replace',
             )
             if flake_result.stdout:
                 print("Warning: Lint check found issues")
@@ -381,12 +429,10 @@ def code_insert(file_path, new_code, line_number):
     Returns:
         bool: Whether insertion was successful
     """
-    # Check if file exists
     if not os.path.exists(file_path):
         print("Error: File '{}' does not exist".format(file_path))
         return False
 
-    # Read file content
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
@@ -394,7 +440,6 @@ def code_insert(file_path, new_code, line_number):
         print("Error: Cannot read file - {}".format(e))
         return False
 
-    # Validate line number (1-based indexing)
     if line_number < 1:
         print("Error: Line number must be >= 1")
         return False
@@ -404,30 +449,27 @@ def code_insert(file_path, new_code, line_number):
             line_number, len(lines) + 1))
         return False
 
-    # Prepare new code with proper newline
     if not new_code.endswith('\n'):
         new_code = new_code + '\n'
 
-    # Insert new code at specified line (convert to 0-based index)
     insert_index = line_number - 1
     lines.insert(insert_index, new_code)
 
-    # Join all lines to create new content
     new_content = ''.join(lines)
 
-    # Test new code in temporary file first
     tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
     tmp_file.write(new_content)
     tmp_file.close()
     tmp_path = tmp_file.name
 
     try:
-        # Use py_compile for syntax check
         result = subprocess.run(
             ['python', '-m', 'py_compile', tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=10
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=10,
+            errors='replace',
         )
 
         if result.returncode != 0:
@@ -435,22 +477,21 @@ def code_insert(file_path, new_code, line_number):
             print(result.stderr)
             return False
 
-        # Optional: Use pyflakes for deeper check
         try:
             flake_result = subprocess.run(
                 ['pyflakes', tmp_path],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                errors='replace',
                 timeout=10
             )
             if flake_result.stdout:
                 print("Warning: Lint check found issues")
                 print(flake_result.stdout)
         except FileNotFoundError:
-            # pyflakes not installed, skip
             pass
 
-        # Write new content to original file
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
 
@@ -464,12 +505,11 @@ def code_insert(file_path, new_code, line_number):
         print("Error: {}".format(e))
         return False
     finally:
-        # Clean up temporary file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
-def show_code_context(file_path, lines, show_comments=False):
+def print_code_context(file_path, lines, show_comments=False):
     """
     Display code lines from a file with line numbers.
 
@@ -481,7 +521,6 @@ def show_code_context(file_path, lines, show_comments=False):
     Returns:
         None
     """
-    # Validate inputs
     if not os.path.exists(file_path):
         print(f"Error: File not found: {file_path}")
         return
@@ -497,43 +536,35 @@ def show_code_context(file_path, lines, show_comments=False):
         return
 
     try:
-        # Read the file
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
             file_lines = content.splitlines()
 
-        # Validate line numbers
         total_lines = len(file_lines)
         if start_line > total_lines:
             print(f"Error: Start line {start_line} exceeds file length ({total_lines} lines)")
             return
 
-        # Adjust end_line if it exceeds file length
         if end_line > total_lines:
             print(f"Warning: End line {end_line} exceeds file length ({total_lines} lines)")
             end_line = total_lines
 
-        # Get docstring lines if filtering comments
         docstring_lines = set()
         if not show_comments and file_path.endswith('.py'):
             try:
                 tree = ast.parse(content)
-                docstring_lines = _get_all_docstring_lines(tree)
+                docstring_lines = _get_all_docstring_lines(tree, file_lines)
             except:
-                pass  # If parsing fails, just skip docstring filtering
+                pass
 
-        # Display lines
-        for i in range(start_line - 1, end_line):  # Convert to 0-indexed
+        for i in range(start_line - 1, end_line):
             line_num = i + 1
             line = file_lines[i]
 
-            # Filter comments and docstrings
             if not show_comments:
                 stripped = line.strip()
-                # Skip # comments
                 if stripped.startswith('#'):
                     continue
-                # Skip docstring lines
                 if i in docstring_lines:
                     continue
 
@@ -549,8 +580,17 @@ def show_code_context(file_path, lines, show_comments=False):
         return
 
 
-def _get_all_docstring_lines(tree):
-    """Get all docstring line numbers in the AST tree"""
+def _get_all_docstring_lines(tree, source_lines):
+    """
+    Get all docstring line numbers in the AST tree (compatible with Python 3.6+)
+
+    Args:
+        tree: AST tree
+        source_lines: List of source code lines
+
+    Returns:
+        Set of docstring line numbers (0-based)
+    """
     docstring_lines = set()
 
     for node in ast.walk(tree):
@@ -558,7 +598,6 @@ def _get_all_docstring_lines(tree):
             if not node.body:
                 continue
 
-            # Check if first statement is a docstring
             first_stmt = node.body[0]
             if isinstance(first_stmt, ast.Expr):
                 value = first_stmt.value
@@ -569,7 +608,8 @@ def _get_all_docstring_lines(tree):
                     is_docstring = True
 
                 if is_docstring:
-                    for line_num in range(first_stmt.lineno - 1, first_stmt.end_lineno):
+                    end_line = get_node_end_lineno(first_stmt, source_lines)
+                    for line_num in range(first_stmt.lineno - 1, end_line):
                         docstring_lines.add(line_num)
 
     return docstring_lines
@@ -592,9 +632,11 @@ def exec_bash_cmd(cmd):
     result = subprocess.run(
         cmd,
         shell=True,
-        capture_output=True,
-        text=True,
-        executable='/bin/bash'
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        executable='/bin/bash',
+        errors='replace',
     )
 
     print('bash execution output:\n', result.stdout)
@@ -612,12 +654,10 @@ def save_code_to_file(code_str, file_path):
         True if successful, False otherwise
     """
     try:
-        # Create directory if it doesn't exist
         dir_name = os.path.dirname(file_path)
         if dir_name and not os.path.exists(dir_name):
             os.makedirs(dir_name)
 
-        # Write code to file
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(code_str)
 
@@ -633,24 +673,17 @@ def save_code_to_file(code_str, file_path):
 
 def submit():
     """
-    执行提交命令并返回 git diff 的 patch 内容
-
-    Args:
-        cwd: 工作目录路径，默认为当前目录
-        timeout: 命令超时时间（秒），默认 30 秒
-
-    Returns:
-        dict: 包含 returncode, output, stderr 的字典
+    Submit final output by adding all changes to git and showing diff
     """
     command = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached"
 
     result = subprocess.run(
         command,
-        shell=True,  # 需要 shell=True 来执行 && 连接的命令
-        capture_output=True,  # 捕获 stdout 和 stderr
-        text=True,  # 以文本模式返回（而不是字节）
-        encoding='utf-8',
-        errors='replace'  # 处理编码错误
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        errors='replace'
     )
 
     print(result.stdout)

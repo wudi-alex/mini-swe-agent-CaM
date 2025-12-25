@@ -73,23 +73,28 @@ class ProgressTrackingAgent(DefaultAgent):
         function_code = response["content"].strip()
 
         # 读取本地 tools.py 文件内容
+        # 获取当前脚本所在目录
+        current_dir = Path(__file__).parent
+
+        # 构建 tools.py 路径
+        tools_path = current_dir / 'tools.py'
         try:
-            with open('tools.py', 'r', encoding='utf-8') as f:
+            with open(tools_path, 'r', encoding='utf-8') as f:
                 tools_code = f.read()
         except FileNotFoundError:
             raise FileNotFoundError("tools.py file not found in current directory")
 
         # 提取函数名（从 def function_name(): 中提取）
         func_name_match = re.search(r'def\s+(\w+)\s*\(', function_code)
-        if not func_name_match:
+        if not func_name_match and function_code != 'submit()':
             raise FormatError(
                 f"Could not extract function name from response. "
                 f"Expected format: def action(): ..."
             )
-        func_name = func_name_match.group(1)
+        func_name = func_name_match.group(1) if function_code != 'submit()' else None
 
         # 拼接完整代码：tools定义 + agent函数 + 函数调用
-        full_code = f"{tools_code}\n\n{function_code}\n\n{func_name}()"
+        full_code = f"{tools_code}\n\n{function_code}\n\n{func_name}()" if function_code != 'submit()' else f"{tools_code}\n\n{function_code}"
 
         # 转义代码中的特殊字符用于shell命令
         # 将单引号替换为 '\'' (结束单引号、转义单引号、开始新单引号)
@@ -236,7 +241,7 @@ def main(
     model: str | None = typer.Option(None, "-m", "--model", help="Model to use", rich_help_panel="Basic"),
     model_class: str | None = typer.Option(None, "-c", "--model-class", help="Model class to use (e.g., 'anthropic' or 'minisweagent.models.anthropic.AnthropicModel')", rich_help_panel="Advanced"),
     redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
-    config_spec: Path = typer.Option( builtin_config_dir / "extra" / "swebench.yaml", "-c", "--config", help="Path to a config file", rich_help_panel="Basic"),
+    config_spec: Path = typer.Option( builtin_config_dir / "extra" / "swebench_cam_no_thinking.yaml", "-c", "--config", help="Path to a config file", rich_help_panel="Basic"),
     environment_class: str | None = typer.Option( None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
 ) -> None:
     # fmt: on
