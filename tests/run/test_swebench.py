@@ -147,7 +147,7 @@ def test_filter_instances_filter_and_slice():
 
 
 def test_filter_instances_shuffle():
-    """Test filter_instances with shuffle enabled produces deterministic results"""
+    """Test filter_instances with shuffle enabled produces deterministic run_results"""
     instances = [{"instance_id": f"repo{i:02d}__test{i}"} for i in range(10)]
     # Test that shuffle produces same result with same seed
     result1 = filter_instances(instances.copy(), filter_spec="", slice_spec="", shuffle=True)
@@ -296,7 +296,7 @@ def test_remove_from_preds_file_no_file(tmp_path):
 
 @pytest.mark.slow
 def test_redo_existing_false_skips_existing(github_test_data, tmp_path):
-    """Test that redo_existing=False skips instances that already have results"""
+    """Test that redo_existing=False skips instances that already have run_results"""
     model_responses = github_test_data["model_responses"]
 
     # Create existing preds.json with one instance
@@ -331,7 +331,7 @@ def test_redo_existing_false_skips_existing(github_test_data, tmp_path):
 
 @pytest.mark.slow
 def test_redo_existing_true_overwrites_existing(github_test_data, tmp_path):
-    """Test that redo_existing=True processes instances even if they already have results"""
+    """Test that redo_existing=True processes instances even if they already have run_results"""
     model_responses = github_test_data["model_responses"]
 
     # Create existing preds.json with one instance

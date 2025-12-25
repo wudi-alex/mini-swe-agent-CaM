@@ -43,7 +43,7 @@ def test_set_cache_control_offset_deprecated():
     result_with_offset = set_cache_control(input_messages, last_n_messages_offset=1)
     result_without_offset = set_cache_control(input_messages)
 
-    # Both results should be identical - offset should have no effect
+    # Both run_results should be identical - offset should have no effect
     assert result_with_offset == result_without_offset
 
     # Only the last message should have cache control

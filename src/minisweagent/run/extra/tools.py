@@ -3,6 +3,7 @@ import os
 import subprocess
 import json
 import re
+import tempfile
 
 
 def find_definition_file(names, search_path="."):
@@ -154,146 +155,318 @@ def _print_code_with_lines(lines, node, show_comments):
         print(f"{i + 1}: {line}")
 
 
-def code_replace(file_path, old_code_lines, new_code):
+def remove_comments_with_mapping(code):
     """
-    Replace lines of code in a file with new code and validate syntax.
+    Remove comments from Python code and create line mapping
 
     Args:
-        file_path: Path to the file to modify
-        old_code_lines: Tuple or list of [start_line, end_line] (1-indexed, inclusive)
-        new_code: String containing the new code to replace the old lines
+        code: Python code string
 
     Returns:
-        True if replacement successful, False otherwise
-
-    Raises:
-        Exception: If syntax error is found after replacement
-
-    Note:
-        - If no backup file exists, creates a backup file with '_temp' suffix
-        - If backup exists, always replaces based on backup content and saves to original file
-        - This allows multiple replacement attempts based on the original content
+        Tuple of (code_no_comments, line_mapping)
+        line_mapping[i] = original line number for comment-free line i
     """
-    # Validate inputs
+    lines = code.split('\n')
+    result_lines = []
+    line_mapping = []
+    in_multiline = False
+    multiline_char = None
+
+    for orig_idx, line in enumerate(lines):
+        if in_multiline:
+            if multiline_char * 3 in line:
+                in_multiline = False
+                idx = line.find(multiline_char * 3)
+                remaining = line[idx + 3:].strip()
+                if remaining:
+                    result_lines.append(remaining)
+                    line_mapping.append(orig_idx)
+            continue
+
+        stripped = line.strip()
+        if stripped.startswith('"""') or stripped.startswith("'''"):
+            quote_char = stripped[0]
+            if stripped.count(quote_char * 3) >= 2:
+                continue
+            else:
+                in_multiline = True
+                multiline_char = quote_char
+                continue
+
+        processed_line = line
+        if '#' in line:
+            in_string = False
+            string_char = None
+            for i, char in enumerate(line):
+                if char in ('"', "'") and (i == 0 or line[i - 1] != '\\'):
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif char == string_char:
+                        in_string = False
+                elif char == '#' and not in_string:
+                    processed_line = line[:i].rstrip()
+                    break
+        else:
+            processed_line = line.rstrip()
+
+        result_lines.append(processed_line)
+        line_mapping.append(orig_idx)
+
+    return '\n'.join(result_lines), line_mapping
+
+
+def normalize(text):
+    """Normalize text, handle newlines and extra spaces"""
+    lines = text.splitlines()
+    normalized_lines = [line.rstrip() for line in lines]
+    return '\n'.join(normalized_lines)
+
+
+def find_code_block_lines(file_content, old_code):
+    """
+    Find the line range where old_code exists in file_content
+    Comparison is done without comments
+
+    Args:
+        file_content: File content as string
+        old_code: Code block to find
+
+    Returns:
+        Tuple of (start_line, end_line) in original file line numbers (0-based),
+        or (None, None) if not found
+    """
+    old_code_normalized = normalize(old_code)
+    old_code_no_comments, _ = remove_comments_with_mapping(old_code_normalized)
+    old_lines = [line.strip() for line in old_code_no_comments.split('\n') if line.strip()]
+
+    if not old_lines:
+        return None, None
+
+    file_content_no_comments, line_mapping = remove_comments_with_mapping(file_content)
+    file_lines_no_comments = [line.strip() for line in file_content_no_comments.split('\n')]
+
+    num_old = len(old_lines)
+    num_file = len(file_lines_no_comments)
+
+    for i in range(num_file):
+        match_count = 0
+        old_idx = 0
+        file_idx = i
+        first_match_idx = None
+        last_match_idx = None
+
+        while old_idx < num_old and file_idx < num_file:
+            if file_lines_no_comments[file_idx] == old_lines[old_idx]:
+                if first_match_idx is None:
+                    first_match_idx = file_idx
+                last_match_idx = file_idx
+                match_count += 1
+                old_idx += 1
+                file_idx += 1
+            elif not file_lines_no_comments[file_idx]:
+                file_idx += 1
+            else:
+                break
+
+        if match_count == num_old:
+            orig_start = line_mapping[first_match_idx]
+            orig_end = line_mapping[last_match_idx]
+            return orig_start, orig_end
+
+    return None, None
+
+
+def code_replace(file_path, old_code, new_code):
+    """
+    Replace code in Python file and perform lint check
+    Ignores comments when matching old code
+    Replaces by line range (including comment lines)
+
+    Args:
+        file_path: Path to Python file
+        old_code: Code to be replaced (comments are ignored during matching)
+        new_code: New code
+
+    Returns:
+        bool: Whether replacement was successful
+    """
     if not os.path.exists(file_path):
-        print(f"Error: File not found: {file_path}")
-        return
-
-    if len(old_code_lines) != 2:
-        print("Error: old_code_lines must be [start_line, end_line]")
-        return
-
-    start_line, end_line = old_code_lines
-
-    if start_line < 1 or end_line < start_line:
-        print(f"Error: Invalid line range [{start_line}, {end_line}]")
-        return
+        print("Error: File '{}' does not exist".format(file_path))
+        return False
 
     try:
-        # Generate backup file path
-        dir_name = os.path.dirname(file_path)
-        base_name = os.path.basename(file_path)
-        name_parts = os.path.splitext(base_name)
-        backup_file = os.path.join(dir_name, name_parts[0] + '_temp' + name_parts[1])
+        with open(file_path, 'r', encoding='utf-8') as f:
+            original_content = f.read()
+    except Exception as e:
+        print("Error: Cannot read file {}".format(e))
+        return False
 
-        # Check if backup file exists
-        if not os.path.exists(backup_file):
-            # Create backup file
-            with open(file_path, 'r', encoding='utf-8') as f:
-                original_content = f.read()
-            with open(backup_file, 'w', encoding='utf-8') as f:
-                f.write(original_content)
-            source_file = file_path
-        else:
-            # Use backup file as source
-            source_file = backup_file
+    start_line, end_line = find_code_block_lines(original_content, old_code)
 
-        # Read from source file (either original or backup)
-        with open(source_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+    if start_line is None:
+        print("Error: Code to replace not found in file")
+        print("Looking for:\n{}".format(old_code))
+        return False
 
-        # Validate line numbers
-        if start_line > len(lines) or end_line > len(lines):
-            print(f"Error: Line range [{start_line}, {end_line}] exceeds file length ({len(lines)} lines)")
+    file_lines = original_content.split('\n')
+    new_code_normalized = normalize(new_code)
+    new_code_lines = new_code_normalized.split('\n')
+
+    new_file_lines = (
+            file_lines[:start_line] +
+            new_code_lines +
+            file_lines[end_line + 1:]
+    )
+
+    new_content = '\n'.join(new_file_lines)
+
+    tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
+    tmp_file.write(new_content)
+    tmp_file.close()
+    tmp_path = tmp_file.name
+
+    try:
+        result = subprocess.run(
+            ['python', '-m', 'py_compile', tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            print("Error: Syntax error in replaced code")
+            print(result.stderr)
             return False
 
-        # Convert to 0-indexed
-        start_idx = start_line - 1
-        end_idx = end_line  # end_line is inclusive, so this is correct for slicing
-
-        # Prepare new code lines
-        if not new_code.endswith('\n'):
-            new_code += '\n'
-        new_code_lines = new_code.splitlines(keepends=True)
-
-        # Replace the lines
-        new_lines = lines[:start_idx] + new_code_lines + lines[end_idx:]
-        new_content = ''.join(new_lines)
-
-        # Validate syntax using AST
         try:
-            ast.parse(new_content, filename=file_path)
-        except SyntaxError as e:
-            print(f"Syntax Error:")
-            print(f"  Line: {e.lineno}")
-            print(f"  Message: {e.msg}")
-            return
+            flake_result = subprocess.run(
+                ['pyflakes', tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if flake_result.stdout:
+                print("Warning: Lint check found issues")
+                print(flake_result.stdout)
+        except FileNotFoundError:
+            pass
 
-        # If syntax is valid, write the new content
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
-            print('Replaced.')
-        return
 
+        print("Replaced")
+        return True
+
+    except subprocess.TimeoutExpired:
+        print("Error: Lint check timeout")
+        return False
     except Exception as e:
-        print(f"Error during code replacement: {e}")
-        return
+        print("Error: {}".format(e))
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
-def recover_original_file(file_path):
+def code_insert(file_path, new_code, line_number):
     """
-    Restore the original file content from the backup file.
+    Insert code at specified line number in Python file and perform lint check
 
     Args:
-        file_path: Path to the file to restore
+        file_path: Path to Python file
+        new_code: Code to insert
+        line_number: Line number to insert at (1-based indexing)
 
     Returns:
-        True if restoration successful, False otherwise
-
-    Note:
-        - The backup file (_temp suffix) is retained after restoration
-        - Only restores if backup file exists
+        bool: Whether insertion was successful
     """
+    # Check if file exists
     if not os.path.exists(file_path):
-        print(f"Error: File not found: {file_path}")
-        return
+        print("Error: File '{}' does not exist".format(file_path))
+        return False
 
-    # Generate backup file path
-    dir_name = os.path.dirname(file_path)
-    base_name = os.path.basename(file_path)
-    name_parts = os.path.splitext(base_name)
-    backup_file = os.path.join(dir_name, name_parts[0] + '_temp' + name_parts[1])
+    # Read file content
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print("Error: Cannot read file - {}".format(e))
+        return False
 
-    # Check if backup file exists
-    if not os.path.exists(backup_file):
-        print(f"Error: Backup file not found: {backup_file}")
-        print("No restoration needed - file may not have been modified yet.")
-        return
+    # Validate line number (1-based indexing)
+    if line_number < 1:
+        print("Error: Line number must be >= 1")
+        return False
+
+    if line_number > len(lines) + 1:
+        print("Error: Line number {} exceeds file length (max: {})".format(
+            line_number, len(lines) + 1))
+        return False
+
+    # Prepare new code with proper newline
+    if not new_code.endswith('\n'):
+        new_code = new_code + '\n'
+
+    # Insert new code at specified line (convert to 0-based index)
+    insert_index = line_number - 1
+    lines.insert(insert_index, new_code)
+
+    # Join all lines to create new content
+    new_content = ''.join(lines)
+
+    # Test new code in temporary file first
+    tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
+    tmp_file.write(new_content)
+    tmp_file.close()
+    tmp_path = tmp_file.name
 
     try:
-        # Read backup file content
-        with open(backup_file, 'r', encoding='utf-8') as f:
-            backup_content = f.read()
+        # Use py_compile for syntax check
+        result = subprocess.run(
+            ['python', '-m', 'py_compile', tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
 
-        # Restore original file
+        if result.returncode != 0:
+            print("Error: Syntax error after code insertion")
+            print(result.stderr)
+            return False
+
+        # Optional: Use pyflakes for deeper check
+        try:
+            flake_result = subprocess.run(
+                ['pyflakes', tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if flake_result.stdout:
+                print("Warning: Lint check found issues")
+                print(flake_result.stdout)
+        except FileNotFoundError:
+            # pyflakes not installed, skip
+            pass
+
+        # Write new content to original file
         with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(backup_content)
-            print('Recovered.')
-        return
+            f.write(new_content)
 
+        print("Inserted")
+        return True
+
+    except subprocess.TimeoutExpired:
+        print("Error: Lint check timeout")
+        return False
     except Exception as e:
-        print(f"Error during file restoration: {e}")
-        return
+        print("Error: {}".format(e))
+        return False
+    finally:
+        # Clean up temporary file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def show_code_context(file_path, lines, show_comments=False):
@@ -424,10 +597,7 @@ def exec_bash_cmd(cmd):
         executable='/bin/bash'
     )
 
-    print(json.dumps({
-        'returncode': result.returncode,
-        'output': result.stdout,
-    }))
+    print('bash execution output:\n', result.stdout)
 
 
 def save_code_to_file(code_str, file_path):
@@ -461,48 +631,6 @@ def save_code_to_file(code_str, file_path):
         return
 
 
-def exec_code_file(file_path):
-    """
-    Execute a Python code file.
-
-    Args:
-        file_path: Path to the Python file to execute
-
-    Returns:
-        Dictionary containing execution results on success
-
-    Raises:
-        FileNotFoundError: If the file does not exist
-        subprocess.CalledProcessError: If the Python script exits with non-zero code
-        Exception: For other execution errors
-
-    Note:
-        This function is designed to be called by a subprocess with error handling.
-        Errors are raised directly instead of being caught internally.
-    """
-    # Check if file exists
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Python file not found: {file_path}")
-
-    # Check if file is a Python file
-    if not file_path.endswith('.py'):
-        raise ValueError(f"File must be a Python file (.py): {file_path}")
-
-    # Execute the Python file
-    result = subprocess.run(
-        ['python', file_path],
-        capture_output=True,
-        text=True,
-        check=True  # This will raise CalledProcessError if return code != 0
-    )
-
-    # Return execution results
-    print(json.dumps({
-        'returncode': result.returncode,
-        'output': result.stdout,
-    }))
-
-
 def submit():
     """
     执行提交命令并返回 git diff 的 patch 内容
@@ -525,10 +653,7 @@ def submit():
         errors='replace'  # 处理编码错误
     )
 
-    print(json.dumps({
-        'returncode': result.returncode,
-        'output': result.stdout,
-    }))
+    print(result.stdout)
 
 
 from functools import wraps

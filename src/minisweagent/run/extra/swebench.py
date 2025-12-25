@@ -95,7 +95,7 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
 
 
 def update_preds_file(output_path: Path, instance_id: str, model_name: str, result: str):
-    """Update the output JSON file with results from a single instance."""
+    """Update the output JSON file with run_results from a single instance."""
     with _OUTPUT_FILE_LOCK:
         output_data = {}
         if output_path.exists():

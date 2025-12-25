@@ -18,7 +18,7 @@ def _mock_litellm_completion(response_content="Mock response"):
 
 
 def test_sonnet_4_cache_control_integration():
-    """Test that get_model('sonnet-4') results in cache control being applied when querying."""
+    """Test that get_model('sonnet-4') run_results in cache control being applied when querying."""
     messages = [
         {"role": "user", "content": "Hello, how are you?"},
         {"role": "assistant", "content": "I'm doing well!"},
@@ -67,7 +67,7 @@ def test_sonnet_4_cache_control_integration():
     ],
 )
 def test_get_model_anthropic_applies_cache_control(model_name):
-    """Test that using get_model with anthropic model names results in cache control being applied."""
+    """Test that using get_model with anthropic model names run_results in cache control being applied."""
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello!"},

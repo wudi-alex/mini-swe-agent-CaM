@@ -655,7 +655,7 @@ async def test_smart_input_container_request_input(default_config):
         # Wait for thread to complete
         thread.join(timeout=1)
 
-        # Check results
+        # Check run_results
         assert result_container["result"] == ""
         assert container.pending_prompt is None
         assert container.display is False
