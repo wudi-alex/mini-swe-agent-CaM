@@ -25,7 +25,7 @@ def get_node_end_lineno(node, source_lines):
 
     # Python 3.6/3.7 needs manual calculation
     # Search from start line downward until finding correct end position
-    start_line = node.lineno - 1  # Convert to 0-based
+    start_line = node.lineno - 1  # Convert to 0-based index
 
     # For simple nodes, might be only one line
     if not hasattr(node, 'body') or not node.body:
@@ -43,7 +43,7 @@ def get_node_end_lineno(node, source_lines):
             if line.strip():  # Non-empty line
                 current_indent = len(line) - len(line.lstrip())
                 if current_indent <= start_indent:
-                    return current_line  # 1-based
+                    return current_line + 1  # Convert to 1-based line number
             current_line += 1
 
         return len(source_lines)
@@ -56,14 +56,14 @@ def get_node_end_lineno(node, source_lines):
 
     # Search from last known line number downward for actual end position
     start_indent = len(source_lines[start_line]) - len(source_lines[start_line].lstrip())
-    current_line = last_lineno
+    current_line = last_lineno - 1  # Convert to 0-based index
 
     while current_line < len(source_lines):
         line = source_lines[current_line]
         if line.strip():  # Non-empty line
             current_indent = len(line) - len(line.lstrip())
             if current_indent <= start_indent and current_line > start_line:
-                return current_line  # 1-based
+                return current_line + 1  # Convert to 1-based line number
         current_line += 1
 
     return len(source_lines)
@@ -642,7 +642,7 @@ def exec_bash_cmd(cmd):
     print('bash execution output:\n', result.stdout)
 
 
-def save_code_to_file(code_str, file_path):
+def save_code_to_file(file_path, code_str):
     """
     Save code string to a specified file path.
 
