@@ -36,11 +36,11 @@ class DockerEnvironmentConfig(BaseModel):
 
 class DockerEnvironmentCam:
     def __init__(
-        self,
-        *,
-        config_class: type = DockerEnvironmentConfig,
-        logger: logging.Logger | None = None,
-        **kwargs,
+            self,
+            *,
+            config_class: type = DockerEnvironmentConfig,
+            logger: logging.Logger | None = None,
+            **kwargs,
     ):
         """This class executes bash commands in a Docker container using direct docker commands.
         See `DockerEnvironmentConfig` for keyword arguments.
@@ -49,6 +49,9 @@ class DockerEnvironmentCam:
         self.container_id: str | None = None
         self.config = config_class(**kwargs)
         self._start_container()
+
+        # Setup pytest after container starts
+        self._setup_pytest()
 
     def get_template_vars(self) -> dict[str, Any]:
         return self.config.model_dump()
@@ -79,6 +82,46 @@ class DockerEnvironmentCam:
         )
         self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
         self.container_id = result.stdout.strip()
+
+    def _setup_pytest(self):
+        """Check if pytest is installed and install it if necessary."""
+        # Detect Python version and executable
+        python_check = self.execute("command -v python3 && echo 'python3' || (command -v python && echo 'python')")
+        if python_check["returncode"] != 0 or not python_check["output"].strip():
+            self.logger.warning("Python not found in container, skipping pytest setup")
+            return
+
+        python_exe = python_check["output"].strip().split('\n')[-1]
+
+        # Get Python version
+        version_result = self.execute(f"{python_exe} --version")
+        if version_result["returncode"] == 0:
+            python_version = version_result["output"].strip()
+            self.logger.info(f"Detected {python_version}")
+
+        # Check if pytest is already installed
+        pytest_check = self.execute(f"{python_exe} -m pytest --version 2>&1")
+
+        if pytest_check["returncode"] == 0:
+            pytest_info = pytest_check["output"].strip().split('\n')[0]
+            self.logger.info(f"pytest already installed: {pytest_info}")
+        else:
+            self.logger.info("pytest not found, installing pytest...")
+
+            # Install pytest with fallback for different Python versions
+            install_cmd = f"{python_exe} -m pip install pytest --break-system-packages 2>&1 || {python_exe} -m pip install pytest 2>&1"
+            install_result = self.execute(install_cmd, timeout=120)
+
+            if install_result["returncode"] == 0:
+                # Verify installation
+                verify_result = self.execute(f"{python_exe} -m pytest --version 2>&1")
+                if verify_result["returncode"] == 0:
+                    pytest_info = verify_result["output"].strip().split('\n')[0]
+                    self.logger.info(f"pytest installed successfully: {pytest_info}")
+                else:
+                    self.logger.warning("pytest installation completed but verification failed")
+            else:
+                self.logger.error(f"Failed to install pytest: {install_result['output']}")
 
     def execute(self, command: str, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in the Docker container and return the result as a dict."""
