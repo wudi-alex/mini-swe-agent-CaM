@@ -78,7 +78,7 @@ def main(
         model_class: str | None = typer.Option(None, "-c", "--model-class",
                                                help="Model class to use (e.g., 'anthropic' or 'minisweagent.models.anthropic.AnthropicModel')",
                                                rich_help_panel="Advanced"),
-        config_path: Path = typer.Option(builtin_config_dir / "extra" / "swebench_cam_no_thinking.yaml", "-c", "--config",
+        config_path: Path = typer.Option(builtin_config_dir / "extra" / "swebench_cam.yaml", "-c", "--config",
                                          help="Path to a config file", rich_help_panel="Basic"),
         environment_class: str | None = typer.Option(None, "--environment-class", rich_help_panel="Advanced"),
         exit_immediately: bool = typer.Option(False, "--exit-immediately",
