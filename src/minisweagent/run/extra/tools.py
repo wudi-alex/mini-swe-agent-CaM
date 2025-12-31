@@ -79,7 +79,7 @@ def print_definition_file(names, search_path="."):
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 errors='replace',
             )
@@ -94,7 +94,7 @@ def print_definition_file(names, search_path="."):
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 errors='replace',
             )
@@ -374,7 +374,7 @@ def code_replace(file_path, old_code, new_code):
         result = subprocess.run(
             ['python', '-m', 'py_compile', tmp_path],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             universal_newlines=True,
             timeout=10,
             errors='replace',
@@ -389,7 +389,7 @@ def code_replace(file_path, old_code, new_code):
             flake_result = subprocess.run(
                 ['pyflakes', tmp_path],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 timeout=10,
                 errors='replace',
@@ -403,7 +403,7 @@ def code_replace(file_path, old_code, new_code):
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
 
-        print("Replaced")
+        print("Replaced.")
         return True
 
     except subprocess.TimeoutExpired:
@@ -466,7 +466,7 @@ def code_insert(file_path, new_code, line_number):
         result = subprocess.run(
             ['python', '-m', 'py_compile', tmp_path],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             universal_newlines=True,
             timeout=10,
             errors='replace',
@@ -481,7 +481,7 @@ def code_insert(file_path, new_code, line_number):
             flake_result = subprocess.run(
                 ['pyflakes', tmp_path],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 errors='replace',
                 timeout=10
@@ -495,7 +495,7 @@ def code_insert(file_path, new_code, line_number):
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
 
-        print("Inserted")
+        print("Inserted.")
         return True
 
     except subprocess.TimeoutExpired:
@@ -615,31 +615,35 @@ def _get_all_docstring_lines(tree, source_lines):
     return docstring_lines
 
 
-def exec_bash_cmd(cmd):
+def exec_bash_cmd(cmd, timeout=None):
     """
-    Execute a bash command and display the output.
-
-    Args:
-        cmd: String containing the bash command to execute
-
-    Returns:
-        Dictionary containing:
-            - 'returncode': Exit code of the command (0 for success)
-            - 'stdout': Standard output as string
-            - 'stderr': Standard error as string
-            - 'success': Boolean indicating if command succeeded
+    Execute a bash command and display the output safely.
     """
-    result = subprocess.run(
-        cmd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-        executable='/bin/bash',
-        errors='replace',
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding='utf-8',
+            errors='replace',
+            executable='/bin/bash',
+            timeout=timeout
+        )
 
-    print('bash execution output:\n', result.stdout)
+        output = result.stdout
+
+        try:
+            print('bash execution output:\n', output)
+        except UnicodeEncodeError:
+            terminal_encoding = sys.stdout.encoding or 'ascii'
+            safe_output = output.encode(terminal_encoding, errors='replace').decode(terminal_encoding)
+            print('bash execution output :\n', safe_output)
+
+        return output
+
+    except Exception as e:
+        print(f"Execution failed: {e}")
 
 
 def save_code_to_file(file_path, code_str):
@@ -681,7 +685,7 @@ def submit():
         command,
         shell=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         universal_newlines=True,
         errors='replace'
     )
