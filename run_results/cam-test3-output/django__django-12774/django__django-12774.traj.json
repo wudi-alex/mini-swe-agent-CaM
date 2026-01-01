@@ -1,0 +1,682 @@
+{
+  "info": {
+    "exit_status": "Submitted",
+    "submission": "diff --git a/django/db/models/query.py b/django/db/models/query.py\nindex d9c9b0db04..e8cf3e1e7e 100644\n--- a/django/db/models/query.py\n+++ b/django/db/models/query.py\n@@ -689,8 +689,10 @@ class QuerySet:\n         \"\"\"\n         assert not self.query.is_sliced, \\\n             \"Cannot use 'limit' or 'offset' with in_bulk\"\n-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n-            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+        if field_name != 'pk':\n+            field = self.model._meta.get_field(field_name)\n+            if not field.unique and not any(field_name in uc.fields for uc in self.model._meta.total_unique_constraints):\n+                raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n         if id_list is not None:\n             if not id_list:\n                 return {}\ndiff --git a/repro_in_bulk.py b/repro_in_bulk.py\nnew file mode 100644\nindex 0000000000..12290b8415\n--- /dev/null\n+++ b/repro_in_bulk.py\n@@ -0,0 +1,54 @@\n+class Field:\n+    def __init__(self, name, unique=False):\n+        self.name = name\n+        self.unique = unique\n+\n+class UniqueConstraintSim:\n+    def __init__(self, fields):\n+        self.fields = list(fields)\n+\n+class MetaSim:\n+    def __init__(self, fields, total_unique_constraints):\n+        self._fields = {f.name: f for f in fields}\n+        self.total_unique_constraints = [UniqueConstraintSim(c) for c in total_unique_constraints]\n+    def get_field(self, name):\n+        return self._fields[name]\n+\n+class ModelSim:\n+    def __init__(self, meta):\n+        self._meta = meta\n+\n+def check_in_bulk_field(model, field_name):\n+    if field_name != 'pk':\n+        field = model._meta.get_field(field_name)\n+        if not field.unique and not any(field_name in uc.fields for uc in model._meta.total_unique_constraints):\n+            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+\n+# Case: field not unique=True but covered by a UniqueConstraint\n+fields = [Field('id', unique=True), Field('slug', unique=False)]\n+total_unique_constraints = [['slug']]\n+model = ModelSim(MetaSim(fields, total_unique_constraints))\n+try:\n+    check_in_bulk_field(model, 'slug')\n+    print('OK: slug accepted as unique via UniqueConstraint')\n+except Exception as e:\n+    print('ERROR:', e)\n+    raise SystemExit(1)\n+\n+# Case: non-unique field not covered by UniqueConstraint should raise\n+try:\n+    check_in_bulk_field(model, 'id')  # id is unique -> should pass\n+    print('OK: id accepted as unique field')\n+except Exception as e:\n+    print('ERROR id:', e)\n+    raise SystemExit(1)\n+\n+# Case: another non-unique field without constraint\n+fields.append(Field('title', unique=False))\n+model2 = ModelSim(MetaSim(fields, total_unique_constraints))\n+try:\n+    check_in_bulk_field(model2, 'title')\n+    print('ERROR: title should have raised')\n+    raise SystemExit(1)\n+except ValueError:\n+    print('OK: title correctly rejected as non-unique')\n\n",
+    "model_stats": {
+      "instance_cost": 0.01580455,
+      "api_calls": 11
+    },
+    "mini_version": "1.17.3",
+    "config": {
+      "agent": {
+        "system_template": "You are an ultra token & round-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage and interactive turns. Each of your output is executable python code formated as follows.\n\n  <format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence of reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nCRITICAL STRATEGY: \"Search First, Navigate Later\"\n\nYou must immediately hypothesize the location of the bug based on the Issue Description and use `grep` to pinpoint the exact file and line number when the bug location can be inferred from issue. If you need to understand the structure of codebase first, use 'ls -la'.\n\n## Localization Workflow\n1. **Analyze:** Read the issue to extract key terms (Function names, Class names, Error messages, or unique logic keywords).\n2. **Hypothesize:** If no specific name is given, guess the likely function name (e.g., if the issue is about \"login failure\", guess `login`, `auth`, or `authenticate`).\n3. **Search:** Use `grep -RIn` (or `grep -RInE` for regex) to find definitions or references. **Crucial:** Narrow down your search by specifying file extensions (e.g., `*.py`) and specific directories (e.g., `src/utils`) whenever the context allows.\n4. **Verify:** Only read the specific file content once you have a grep hit.\n\n## Command Best Practices\n- **Standard Search:** `grep -RIn \"Pattern\" .` (Always include line numbers `-n` and ignore binary `-I`).\n- **Filter by File Extension (Highly Recommended):** Use `--include` to avoid noise and save tokens.\n  - Python only: `grep -RIn --include=\"*.py\" \"Pattern\" .`\n  - Java only: `grep -RIn --include=\"*.java\" \"Pattern\" .`\n  - C/C++: `grep -RIn --include=\"*.{c,h,cpp}\" \"Pattern\" .`\n- **Target Specific Directory:** If the issue clearly points to a module (e.g., \"frontend\", \"utils\"), replace `.` with the specific path.\n  - Example: `grep -RIn \"Pattern\" src/utils`\n- **Complex Patterns:** `grep -RInE \"PatternA|PatternB\" .`\n- **Definitions:**\n  - Function: `grep -RIn \"^def function_name\" .`\n  - Class: `grep -RIn \"^class ClassName\" .`\n  - Function Call: `grep -RIn \"^function_name(\" .`\n\n## Examples of Strategic Searching\n\n### Scenario 1: The issue explicitly names a function in a known language (e.g., \"Integer overflow in `calculate_budget` in the Python backend\")\n**Thought:** IFilter for `.py` files to avoid matching compiled files or logs.\n**Command:** `grep -RIn --include=\"*.py\" \"def calculate_budget\" .`\n\n### Scenario 2: The issue implies a specific module location (e.g., \"The `DateUtils` helper in the utility folder is parsing dates wrong\")\n**Thought:** The issue points to `utils` or a similar folder. Restrict the search to that directory to speed up the process and reduce noise.\n**Command:** `grep -RIn \"class DateUtils\" src/utils`\n\n### Scenario 3: Investigating a symptom in a specific component (e.g., \"Login page raises an error on button click\")\n**Thought:** This is likely a frontend issue or a views issue. Search for \"login\" logic specifically in the `views` or `frontend` directory, and I am looking for Python files.\n**Command:** `grep -RIn --include=\"*.py\" -i \"login\" src/views`\n\n### Scenario 4: Broad search for keywords with file restrictions (e.g., \"JSON serialization fails during export\")\n**Thought:** No function name is given, but \"JSON\" and \"export\" are key. Look for functions that combine these concepts, restricting to `.py` files to filter out noise.\n**Command:** `grep -RInE --include=\"*.py\" \"json.*dump|export|serialize\" .`\n\n### Scenario 5: Tracing a call site in a test file (e.g., \"The test `test_process_payment` is failing\")\n**Thought:** Find the test definition. It is likely in a `tests` directory.\n**Command:** `grep -RIn \"def test_process_payment\" tests/`\n\n---\n**ACTION REQUIRED:**\nBased on the current issue description, generate your hypothesis, construct a precise `grep` command (using `--include` and specific paths if possible), and execute it immediately.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)];\n2. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path;\n3. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code or patch code replacement;\n4. save_code_to_file(file_path: str, code: str,): tool used to save code to file_path, for example, creating testing scripts;\n5. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\n## Other Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.\n",
+        "instance_template": "<pr_description>\nConsider the following PR description:\n{{task}}\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>\n",
+        "timeout_template": "The last action timed out and has been killed.\nThe output of the action was:\n{% if output | length < 10000 -%}\n<output>\n{{output}}\n</output>\n{%- else -%}\n<warning>Output was too long and has been truncated.</warning>\n<output_head>\n{{ output[:5000] }}\n</output_head>\n<elided_chars>{{ output | length - 10000 }} characters elided</elided_chars>\n<output_tail>\n{{ output[-5000:] }}\n</output_tail>\n{%- endif %}\nPlease try another command and make sure to avoid those requiring interactive input.\n",
+        "format_error_template": "Please always provide EXACTLY ONE action in triple backticks, found actions.\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).\n",
+        "action_observation_template": "<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n",
+        "action_regex": "```bash\\s*\\n(.*?)\\n```",
+        "step_limit": 100,
+        "cost_limit": 0.2
+      },
+      "model": {
+        "model_name": "openai/gpt-5-mini",
+        "model_kwargs": {},
+        "litellm_model_registry": null,
+        "set_cache_control": null,
+        "cost_tracking": "default"
+      },
+      "environment": {
+        "image": "docker.io/swebench/sweb.eval.x86_64.django_1776_django-12774:latest",
+        "cwd": "/testbed",
+        "env": {
+          "PAGER": "cat",
+          "MANPAGER": "cat",
+          "LESS": "-R",
+          "PIP_PROGRESS_BAR": "off",
+          "TQDM_DISABLE": "1"
+        },
+        "forward_env": [],
+        "timeout": 60,
+        "executable": "docker",
+        "run_args": [
+          "--rm"
+        ],
+        "container_timeout": "2h",
+        "pull_timeout": 120
+      },
+      "agent_type": "minisweagent.run.extra.swebench_cam.ProgressTrackingAgent",
+      "model_type": "minisweagent.models.litellm_model.LitellmModel",
+      "environment_type": "minisweagent.environments.docker_cam.DockerEnvironmentCam"
+    }
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an ultra token & round-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage and interactive turns. Each of your output is executable python code formated as follows.\n\n  <format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence of reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nCRITICAL STRATEGY: \"Search First, Navigate Later\"\n\nYou must immediately hypothesize the location of the bug based on the Issue Description and use `grep` to pinpoint the exact file and line number when the bug location can be inferred from issue. If you need to understand the structure of codebase first, use 'ls -la'.\n\n## Localization Workflow\n1. **Analyze:** Read the issue to extract key terms (Function names, Class names, Error messages, or unique logic keywords).\n2. **Hypothesize:** If no specific name is given, guess the likely function name (e.g., if the issue is about \"login failure\", guess `login`, `auth`, or `authenticate`).\n3. **Search:** Use `grep -RIn` (or `grep -RInE` for regex) to find definitions or references. **Crucial:** Narrow down your search by specifying file extensions (e.g., `*.py`) and specific directories (e.g., `src/utils`) whenever the context allows.\n4. **Verify:** Only read the specific file content once you have a grep hit.\n\n## Command Best Practices\n- **Standard Search:** `grep -RIn \"Pattern\" .` (Always include line numbers `-n` and ignore binary `-I`).\n- **Filter by File Extension (Highly Recommended):** Use `--include` to avoid noise and save tokens.\n  - Python only: `grep -RIn --include=\"*.py\" \"Pattern\" .`\n  - Java only: `grep -RIn --include=\"*.java\" \"Pattern\" .`\n  - C/C++: `grep -RIn --include=\"*.{c,h,cpp}\" \"Pattern\" .`\n- **Target Specific Directory:** If the issue clearly points to a module (e.g., \"frontend\", \"utils\"), replace `.` with the specific path.\n  - Example: `grep -RIn \"Pattern\" src/utils`\n- **Complex Patterns:** `grep -RInE \"PatternA|PatternB\" .`\n- **Definitions:**\n  - Function: `grep -RIn \"^def function_name\" .`\n  - Class: `grep -RIn \"^class ClassName\" .`\n  - Function Call: `grep -RIn \"^function_name(\" .`\n\n## Examples of Strategic Searching\n\n### Scenario 1: The issue explicitly names a function in a known language (e.g., \"Integer overflow in `calculate_budget` in the Python backend\")\n**Thought:** IFilter for `.py` files to avoid matching compiled files or logs.\n**Command:** `grep -RIn --include=\"*.py\" \"def calculate_budget\" .`\n\n### Scenario 2: The issue implies a specific module location (e.g., \"The `DateUtils` helper in the utility folder is parsing dates wrong\")\n**Thought:** The issue points to `utils` or a similar folder. Restrict the search to that directory to speed up the process and reduce noise.\n**Command:** `grep -RIn \"class DateUtils\" src/utils`\n\n### Scenario 3: Investigating a symptom in a specific component (e.g., \"Login page raises an error on button click\")\n**Thought:** This is likely a frontend issue or a views issue. Search for \"login\" logic specifically in the `views` or `frontend` directory, and I am looking for Python files.\n**Command:** `grep -RIn --include=\"*.py\" -i \"login\" src/views`\n\n### Scenario 4: Broad search for keywords with file restrictions (e.g., \"JSON serialization fails during export\")\n**Thought:** No function name is given, but \"JSON\" and \"export\" are key. Look for functions that combine these concepts, restricting to `.py` files to filter out noise.\n**Command:** `grep -RInE --include=\"*.py\" \"json.*dump|export|serialize\" .`\n\n### Scenario 5: Tracing a call site in a test file (e.g., \"The test `test_process_payment` is failing\")\n**Thought:** Find the test definition. It is likely in a `tests` directory.\n**Command:** `grep -RIn \"def test_process_payment\" tests/`\n\n---\n**ACTION REQUIRED:**\nBased on the current issue description, generate your hypothesis, construct a precise `grep` command (using `--include` and specific paths if possible), and execute it immediately.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)];\n2. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path;\n3. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code or patch code replacement;\n4. save_code_to_file(file_path: str, code: str,): tool used to save code to file_path, for example, creating testing scripts;\n5. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\n## Other Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.",
+      "timestamp": 1767239391.6249998
+    },
+    {
+      "role": "user",
+      "content": "<pr_description>\nConsider the following PR description:\nAllow QuerySet.in_bulk() for fields with total UniqueConstraints.\nDescription\n\t\nIf a field is unique by UniqueConstraint instead of unique=True running in_bulk() on that field will fail.\nConsider:\nclass Article(models.Model):\n\tslug = models.CharField(max_length=255)\n\t\n\tclass Meta:\n\t\tconstraints = [\n\t\t\tmodels.UniqueConstraint(fields=[\"slug\"], name=\"%(app_label)s_%(class)s_slug_unq\")\n\t\t]\n>>> Article.objects.in_bulk(field_name=\"slug\")\nTraceback (most recent call last):\n File \"/usr/local/lib/python3.8/code.py\", line 90, in runcode\n\texec(code, self.locals)\n File \"<console>\", line 1, in <module>\n File \"/app/venv/lib/python3.8/site-packages/django/db/models/manager.py\", line 82, in manager_method\n\treturn getattr(self.get_queryset(), name)(*args, **kwargs)\n File \"/app/venv/lib/python3.8/site-packages/django/db/models/query.py\", line 680, in in_bulk\n\traise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\nValueError: in_bulk()'s field_name must be a unique field but 'slug' isn't.\nIt should be pretty simple to fix this and I have a patch if accepted.\n\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>",
+      "timestamp": 1767239391.6259997
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search for the in_bulk implementation to locate the validation rejecting fields that are unique via UniqueConstraint.\n@bug_localization\ndef grep_in_bulk_to_find_location():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"def in_bulk|in_bulk\\\\(\" .')\n",
+      "timestamp": 1767239395.786105,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3z58Z7Mokwzu4Y6bYbZn8Dk8OZc",
+          "created": 1767239391,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search for the in_bulk implementation to locate the validation rejecting fields that are unique via UniqueConstraint.\n@bug_localization\ndef grep_in_bulk_to_find_location():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"def in_bulk|in_bulk\\\\(\" .')\n",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 266,
+            "prompt_tokens": 2407,
+            "total_tokens": 2673,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 192,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n ./django/db/models/query.py:685:    def in_bulk(self, id_list=None, *, field_name='pk'):\n./django/db/models/query.py:693:            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n./tests/lookup/tests.py:145:    def test_in_bulk(self):\n./tests/lookup/tests.py:146:        # in_bulk() takes a list of IDs and returns a dictionary mapping IDs to objects.\n./tests/lookup/tests.py:147:        arts = Article.objects.in_bulk([self.a1.id, self.a2.id])\n./tests/lookup/tests.py:151:            Article.objects.in_bulk(),\n./tests/lookup/tests.py:162:        self.assertEqual(Article.objects.in_bulk([self.a3.id]), {self.a3.id: self.a3})\n./tests/lookup/tests.py:163:        self.assertEqual(Article.objects.in_bulk({self.a3.id}), {self.a3.id: self.a3})\n./tests/lookup/tests.py:164:        self.assertEqual(Article.objects.in_bulk(frozenset([self.a3.id])), {self.a3.id: self.a3})\n./tests/lookup/tests.py:165:        self.assertEqual(Article.objects.in_bulk((self.a3.id,)), {self.a3.id: self.a3})\n./tests/lookup/tests.py:166:        self.assertEqual(Article.objects.in_bulk([1000]), {})\n./tests/lookup/tests.py:167:        self.assertEqual(Article.objects.in_bulk([]), {})\n./tests/lookup/tests.py:168:        self.assertEqual(Article.objects.in_bulk(iter([self.a1.id])), {self.a1.id: self.a1})\n./tests/lookup/tests.py:169:        self.assertEqual(Article.objects.in_bulk(iter([])), {})\n./tests/lookup/tests.py:171:            Article.objects.in_bulk(headline__startswith='Blah')\n./tests/lookup/tests.py:180:            self.assertEqual(Author.objects.in_bulk(authors), authors)\n./tests/lookup/tests.py:184:            Article.objects.in_bulk([self.a1.slug, self.a2.slug, self.a3.slug], field_name='slug'),\n./tests/lookup/tests.py:193:        msg = \"in_bulk()'s field_name must be a unique field but 'author' isn't.\"\n./tests/lookup/tests.py:195:            Article.objects.in_bulk([self.au1], field_name='author')\n./tests/prefetch_related/tests.py:1209:    def test_in_bulk(self):\n./tests/prefetch_related/tests.py:1218:            bulk = Employee.objects.prefetch_related('serfs').in_bulk([boss1.pk, boss2.pk])\n./tests/custom_pk/tests.py:151:    def test_in_bulk(self):\n./tests/custom_pk/tests.py:155:        emps = Employee.objects.in_bulk([123, 456])\n./tests/custom_pk/tests.py:158:        self.assertEqual(Business.objects.in_bulk([\"Sears\"]), {\n./tests/or_lookups/tests.py:238:            Article.objects.filter(Q(headline__startswith='Hello')).in_bulk([self.a1, self.a2]),\n\n</output>",
+      "timestamp": 1767239397.1674414
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Inspect the in_bulk implementation to find the uniqueness check referring only to field.unique.\n@bug_localization\ndef print_in_bulk_definition_to_inspect():\n    return print_code_context('django/db/models/query.py', (670,720))",
+      "timestamp": 1767239401.048165,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3zBxlxbKnmk84uSnRmKUXqVTKjs",
+          "created": 1767239397,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Inspect the in_bulk implementation to find the uniqueness check referring only to field.unique.\n@bug_localization\ndef print_in_bulk_definition_to_inspect():\n    return print_code_context('django/db/models/query.py', (670,720))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 251,
+            "prompt_tokens": 3175,
+            "total_tokens": 3426,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 192,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 1792,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 670         return self._earliest(*fields)\n 671 \n 672     def latest(self, *fields):\n 673         return self.reverse()._earliest(*fields)\n 674 \n 675     def first(self):\n 678             return obj\n 679 \n 680     def last(self):\n 683             return obj\n 684 \n 685     def in_bulk(self, id_list=None, *, field_name='pk'):\n 686         \"\"\"\n 687         Return a dictionary mapping each of the given IDs to the object with\n 688         that ID. If `id_list` isn't provided, evaluate the entire QuerySet.\n 691             \"Cannot use 'limit' or 'offset' with in_bulk\"\n 692         if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n 693             raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n 694         if id_list is not None:\n 695             if not id_list:\n 696                 return {}\n 697             filter_key = '{}__in'.format(field_name)\n 698             batch_size = connections[self.db].features.max_query_params\n 699             id_list = tuple(id_list)\n 702             if batch_size and batch_size < len(id_list):\n 703                 qs = ()\n 704                 for offset in range(0, len(id_list), batch_size):\n 705                     batch = id_list[offset:offset + batch_size]\n 706                     qs += tuple(self.filter(**{filter_key: batch}).order_by())\n 707             else:\n 708                 qs = self.filter(**{filter_key: id_list}).order_by()\n 709         else:\n 710             qs = self._chain()\n 711         return {getattr(obj, field_name): obj for obj in qs}\n 712 \n 713     def delete(self):\n 716         assert not self.query.is_sliced, \\\n 717             \"Cannot use 'limit' or 'offset' with delete.\"\n 718 \n 719         if self._fields is not None:\n 720             raise TypeError(\"Cannot call delete() after .values() or .values_list()\")\n</output>",
+      "timestamp": 1767239401.3486602
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Show the test that references slug to ensure we cover the failing case and know expected behavior.\n@bug_localization\ndef print_tests_lookup_context_to_inspect():\n    return print_code_context('tests/lookup/tests.py', (160,200))",
+      "timestamp": 1767239411.894602,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3zFtUdb8IfeC3fIhrD68gMB7Ajo",
+          "created": 1767239401,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Show the test that references slug to ensure we cover the failing case and know expected behavior.\n@bug_localization\ndef print_tests_lookup_context_to_inspect():\n    return print_code_context('tests/lookup/tests.py', (160,200))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 893,
+            "prompt_tokens": 3708,
+            "total_tokens": 4601,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 832,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 2816,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 160             }\n 161         )\n 162         self.assertEqual(Article.objects.in_bulk([self.a3.id]), {self.a3.id: self.a3})\n 163         self.assertEqual(Article.objects.in_bulk({self.a3.id}), {self.a3.id: self.a3})\n 164         self.assertEqual(Article.objects.in_bulk(frozenset([self.a3.id])), {self.a3.id: self.a3})\n 165         self.assertEqual(Article.objects.in_bulk((self.a3.id,)), {self.a3.id: self.a3})\n 166         self.assertEqual(Article.objects.in_bulk([1000]), {})\n 167         self.assertEqual(Article.objects.in_bulk([]), {})\n 168         self.assertEqual(Article.objects.in_bulk(iter([self.a1.id])), {self.a1.id: self.a1})\n 169         self.assertEqual(Article.objects.in_bulk(iter([])), {})\n 170         with self.assertRaises(TypeError):\n 171             Article.objects.in_bulk(headline__startswith='Blah')\n 172 \n 173     def test_in_bulk_lots_of_ids(self):\n 174         test_range = 2000\n 175         max_query_params = connection.features.max_query_params\n 176         expected_num_queries = ceil(test_range / max_query_params) if max_query_params else 1\n 177         Author.objects.bulk_create([Author() for i in range(test_range - Author.objects.count())])\n 178         authors = {author.pk: author for author in Author.objects.all()}\n 179         with self.assertNumQueries(expected_num_queries):\n 180             self.assertEqual(Author.objects.in_bulk(authors), authors)\n 181 \n 182     def test_in_bulk_with_field(self):\n 183         self.assertEqual(\n 184             Article.objects.in_bulk([self.a1.slug, self.a2.slug, self.a3.slug], field_name='slug'),\n 185             {\n 186                 self.a1.slug: self.a1,\n 187                 self.a2.slug: self.a2,\n 188                 self.a3.slug: self.a3,\n 189             }\n 190         )\n 191 \n 192     def test_in_bulk_non_unique_field(self):\n 193         msg = \"in_bulk()'s field_name must be a unique field but 'author' isn't.\"\n 194         with self.assertRaisesMessage(ValueError, msg):\n 195             Article.objects.in_bulk([self.au1], field_name='author')\n 196 \n 197     def test_values(self):\n 200         self.assertSequenceEqual(\n</output>",
+      "timestamp": 1767239412.1888943
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Find where UniqueConstraint or constraints are defined/accessed in meta to see how uniqueness by constraint is represented.\n@bug_localization\ndef grep_uniqueconstraint_usage_to_locate_meta_methods():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"UniqueConstraint|get_constraints|constraints\" django | sed -n \\'1,200p\\'')",
+      "timestamp": 1767239414.9693522,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3zQHAszcukG2bGmugZhrVyFvfTA",
+          "created": 1767239412,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Find where UniqueConstraint or constraints are defined/accessed in meta to see how uniqueness by constraint is represented.\n@bug_localization\ndef grep_uniqueconstraint_usage_to_locate_meta_methods():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"UniqueConstraint|get_constraints|constraints\" django | sed -n \\'1,200p\\'')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 160,
+            "prompt_tokens": 4318,
+            "total_tokens": 4478,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 2816,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning><output_head>\nbash execution output:\n django/core/management/commands/loaddata.py:122:            connection.check_constraints(table_names=table_names)\ndjango/core/management/commands/inspectdb.py:78:                        constraints = connection.introspection.get_constraints(cursor, table_name)\ndjango/core/management/commands/inspectdb.py:80:                        constraints = {}\ndjango/core/management/commands/inspectdb.py:83:                        c['columns'][0] for c in constraints.values()\ndjango/core/management/commands/inspectdb.py:173:                yield from self.get_meta(table_name, constraints, column_to_field_name, is_view, is_partition)\ndjango/core/management/commands/inspectdb.py:263:    def get_meta(self, table_name, constraints, column_to_field_name, is_view, is_partition):\ndjango/core/management/commands/inspectdb.py:271:        for params in constraints.values():\ndjango/core/checks/model_checks.py:15:    constraints = defaultdict(list)\ndjango/core/checks/model_checks.py:37:        for model_constraint in model._meta.constraints:\ndjango/core/checks/model_checks.py:38:            constraints[model_constraint.name].append(model._meta.label)\ndjango/core/checks/model_checks.py:73:    for constraint_name, model_labels in constraints.items():\ndjango/contrib/gis/db/backends/spatialite/introspection.py:59:    def get_constraints(self, cursor, table_name):\ndjango/contrib/gis/db/backends/spatialite/introspection.py:60:        constraints = super().get_constraints(cursor, table_name)\ndjango/contrib/gis/db/backends/spatialite/introspection.py:65:            constraints['%s__spatial__index' % row[0]] = {\ndjango/contrib/gis/db/backends/spatialite/introspection.py:73:        return constraints\ndjango/contrib/gis/db/backends/spatialite/schema.py:126:    def alter_db_table(self, model, old_db_table, new_db_table, disable_constraints=True):\ndjango/contrib/gis/db/backends/spatialite/schema.py:138:        super().alter_db_table(model, old_db_table, new_db_table, disable_constraints)\ndjango/contrib/postgres/constraints.py:3:from django.db.models.constraints import BaseConstraint\ndjango/contrib/postgres/constraints.py:15:                'Exclusion constraints only support GiST or SP-GiST indexes.'\ndjango/contrib/admin/views/main.py:371:            # unique constraints.\ndjango/contrib/admin/views/main.py:376:                    for constraint in self.lookup_opts.total_unique_constraints\ndjango/contrib/admin/views/main.py:382:                # Composite unique constraints containing a nullable column\ndjango/test/testcases.py:1162:                if self._should_check_constraints(connections[db_name]):\ndjango/test/testcases.py:1163:                    connections[db_name].check_constraints()\ndjango/test/testcases.py:1167:    def _should_check_constraints(self, connection):\ndjango/db/migrations/autodetector.py:124:        self.altered_constraints = {}\ndjango/db/migrations/autodetector.py:178:        self.create_altered_constraints()\ndjango/db/migrations/autodetector.py:180:        self.generate_removed_constraints()\ndjango/db/migrations/autodetector.py:190:        self.generate_added_constraints()\ndjango/db/migrations/autodetector.py:553:            constraints = model_state.options.pop('constraints')\ndjango/db/migrations/autodetector.py:622:            for constraint in constraints:\ndjango/db/migrations/autodetector.py:1030:    def create_altered_constraints(self):\ndjango/db/migrations/autodetector.py:1037:            old_constraints = old_model_state.options[option_name]\ndjango/db/migrations/autodetector.py:1038:            new_constraints = new_model_state.options[option_name]\ndjango/db/migrations/autodetector.py:1039:            add_constraints = [c for c in new_constraints if c not in old_constraints]\ndjango/db/migrations/autodetector.py:1040:            rem_constraints = [c for c in old_constraints if c not in new_constraints]\ndjango/db/migrations/autodetector.py:1042:            self.altered_constraints.update({\ndjango/db/migrations/autodetector.py:1044:                    'added_constraints': add_constraints, 'removed_constraints': rem_constraints,\ndjango/db/migrations/autodetector.py:1048:    def generate_added_constraints(self):\ndjango/db/migrations/autodetector.py:1049:        for (app_label, model_name), alt_constraints in self.altered_constraints.items():\ndjango/db/migrations/autodetector.py:1050:            for constraint in alt_constraints['added_constraints']:\ndjango/db/migrations/autodetector.py:1059:    def generate_removed_constraints(self):\ndjango/db/migrations/autodetector.py:1060:        for (app_label, model_name), alt_constraints in self.altered_constraints.items():\ndjango/db/migrations/autodetector.py:1061:            for constraint in alt_constraints['removed_constraints']:\ndjango/db/migrations/state.py:365:        self.options.setdefault('constraints', [])\ndjango/db/migrations/state.py:446:                elif name == 'constraints':\ndjango/db/migrations/state.py:447:                    options['\n</output_head>\n<elided_chars>\n10724 characters elided\n</elided_chars>\n<output_tail>\nraints = True\ndjango/db/backends/base/features.py:296:    allows_multiple_constraints_on_same_fields = True\ndjango/db/backends/oracle/introspection.py:119:                user_constraints,\ndjango/db/backends/oracle/introspection.py:122:                user_constraints.constraint_name = cols.constraint_name\ndjango/db/backends/oracle/introspection.py:123:                AND user_constraints.table_name = user_tab_identity_cols.table_name\ndjango/db/backends/oracle/introspection.py:125:                AND user_constraints.constraint_type = 'P'\ndjango/db/backends/oracle/introspection.py:151:    FROM   user_constraints, USER_CONS_COLUMNS ca, USER_CONS_COLUMNS cb\ndjango/db/backends/oracle/introspection.py:152:    WHERE  user_constraints.table_name = %s AND\ndjango/db/backends/oracle/introspection.py:153:           user_constraints.constraint_name = ca.constraint_name AND\ndjango/db/backends/oracle/introspection.py:154:           user_constraints.r_constraint_name = cb.constraint_name AND\ndjango/db/backends/oracle/introspection.py:167:            FROM user_constraints c\ndjango/db/backends/oracle/introspection.py:183:                user_constraints,\ndjango/db/backends/oracle/introspection.py:186:                user_constraints.constraint_name = cols.constraint_name AND\ndjango/db/backends/oracle/introspection.py:187:                user_constraints.constraint_type = 'P' AND\ndjango/db/backends/oracle/introspection.py:188:                user_constraints.table_name = UPPER(%s) AND\ndjango/db/backends/oracle/introspection.py:194:    def get_constraints(self, cursor, table_name):\ndjango/db/backends/oracle/introspection.py:196:        Retrieve any constraints or keys (unique, pk, fk, check, index) across\ndjango/db/backends/oracle/introspection.py:199:        constraints = {}\ndjango/db/backends/oracle/introspection.py:200:        # Loop over the constraints, getting PKs, uniques, and checks\ndjango/db/backends/oracle/introspection.py:203:                user_constraints.constraint_name,\ndjango/db/backends/oracle/introspection.py:205:                CASE user_constraints.constraint_type\ndjango/db/backends/oracle/introspection.py:210:                    WHEN user_constraints.constraint_type IN ('P', 'U') THEN 1\ndjango/db/backends/oracle/introspection.py:213:                CASE user_constraints.constraint_type\ndjango/db/backends/oracle/introspection.py:218:                user_constraints\ndjango/db/backends/oracle/introspection.py:220:                user_cons_columns cols ON user_constraints.constraint_name = cols.constraint_name\ndjango/db/backends/oracle/introspection.py:222:                user_constraints.constraint_type = ANY('P', 'U', 'C')\ndjango/db/backends/oracle/introspection.py:223:                AND user_constraints.table_name = UPPER(%s)\ndjango/db/backends/oracle/introspection.py:224:            GROUP BY user_constraints.constraint_name, user_constraints.constraint_type\ndjango/db/backends/oracle/introspection.py:228:            constraints[constraint] = {\ndjango/db/backends/oracle/introspection.py:236:        # Foreign key constraints\ndjango/db/backends/oracle/introspection.py:244:                user_constraints cons\ndjango/db/backends/oracle/introspection.py:256:            constraints[constraint] = {\ndjango/db/backends/oracle/introspection.py:277:                    FROM user_constraints cons\ndjango/db/backends/oracle/introspection.py:284:            constraints[constraint] = {\ndjango/db/backends/oracle/introspection.py:294:        return constraints\ndjango/db/backends/oracle/base.py:134:    data_type_check_constraints = {\ndjango/db/backends/oracle/base.py:299:    def check_constraints(self, table_names=None):\ndjango/db/backends/oracle/base.py:301:        Check constraints by setting them to immediate. Return them to deferred\ndjango/db/backends/oracle/features.py:19:    supports_partially_nullable_unique_constraints = False\ndjango/db/backends/oracle/features.py:60:    allows_multiple_constraints_on_same_fields = False\ndjango/db/backends/oracle/operations.py:368:    def __foreign_key_constraints(self, table_name, recursive):\ndjango/db/backends/oracle/operations.py:377:                        user_constraints cons\ndjango/db/backends/oracle/operations.py:380:                        user_constraints rcons\ndjango/db/backends/oracle/operations.py:394:                        user_constraints cons\ndjango/db/backends/oracle/operations.py:402:    def _foreign_key_constraints(self):\ndjango/db/backends/oracle/operations.py:405:        return lru_cache(maxsize=512)(self.__foreign_key_constraints)\ndjango/db/backends/oracle/operations.py:412:        constraints = set()\ndjango/db/backends/oracle/operations.py:416:        # foreign key constraints and resolving dependencies.\ndjango/db/backends/oracle/operations.py:418:            for foreign_table, constraint in self._foreign_key_constraints(table, recursive=allow_cascade):\ndjango/db/backends/oracle/operations.py:421:                constraints.add((foreign_table, constraint))\n\n\n</output_tail>",
+      "timestamp": 1767239415.2977977
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search for total_unique_constraints on model _meta to see how unique constraints are exposed.\n@bug_localization\ndef grep_total_unique_constraints_usage_to_find_meta():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" \"total_unique_constraints\" .')",
+      "timestamp": 1767239421.6011684,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3zT1ykiUzmADsvosrv3WYAYcGS8",
+          "created": 1767239415,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search for total_unique_constraints on model _meta to see how unique constraints are exposed.\n@bug_localization\ndef grep_total_unique_constraints_usage_to_find_meta():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" \"total_unique_constraints\" .')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 132,
+            "prompt_tokens": 6717,
+            "total_tokens": 6849,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3840,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n ./django/contrib/admin/views/main.py:376:                    for constraint in self.lookup_opts.total_unique_constraints\n./django/db/models/fields/related.py:533:            for uc in self.remote_field.model._meta.total_unique_constraints\n./django/db/models/options.py:832:    def total_unique_constraints(self):\n./django/db/models/base.py:1027:        constraints = [(self.__class__, self._meta.total_unique_constraints)]\n./django/db/models/base.py:1031:            if parent_class._meta.total_unique_constraints:\n./django/db/models/base.py:1033:                    (parent_class, parent_class._meta.total_unique_constraints)\n\n</output>",
+      "timestamp": 1767239421.9547486
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Open the total_unique_constraints property to see how uniqueness via UniqueConstraint is represented.\n@bug_localization\ndef print_total_unique_constraints_definition():\n    return print_code_context('django/db/models/options.py', (780,860))",
+      "timestamp": 1767239424.1559575,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3zZwu69Vr1lFX2sd5rxIO77GNBn",
+          "created": 1767239421,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Open the total_unique_constraints property to see how uniqueness via UniqueConstraint is represented.\n@bug_localization\ndef print_total_unique_constraints_definition():\n    return print_code_context('django/db/models/options.py', (780,860))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 57,
+            "prompt_tokens": 6937,
+            "total_tokens": 6994,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 0,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 780         except KeyError:\n 781             pass\n 782 \n 783         fields = []\n 786         if include_parents is not False:\n 787             for parent in self.parents:\n 791                 if parent in seen_models:\n 792                     continue\n 793                 if (parent._meta.concrete_model != self.concrete_model and\n 794                         include_parents == PROXY_PARENTS):\n 795                     continue\n 796                 for obj in parent._meta._get_fields(\n 797                         forward=forward, reverse=reverse, include_parents=include_parents,\n 798                         include_hidden=include_hidden, seen_models=seen_models):\n 799                     if not getattr(obj, 'parent_link', False) or obj.model == self.concrete_model:\n 800                         fields.append(obj)\n 801         if reverse and not self.proxy:\n 805             all_fields = self._relation_tree\n 806             for field in all_fields:\n 809                 if include_hidden or not field.remote_field.hidden:\n 810                     fields.append(field.remote_field)\n 811 \n 812         if forward:\n 813             fields += self.local_fields\n 814             fields += self.local_many_to_many\n 820             if topmost_call:\n 821                 fields += self.private_fields\n 822 \n 825         fields = make_immutable_fields_list(\"get_fields()\", fields)\n 826 \n 828         self._get_fields_cache[cache_key] = fields\n 829         return fields\n 830 \n 831     @cached_property\n 832     def total_unique_constraints(self):\n 833         \"\"\"\n 834         Return a list of total unique constraints. Useful for determining set\n 835         of fields guaranteed to be unique for all rows.\n 838             constraint\n 839             for constraint in self.constraints\n 840             if isinstance(constraint, UniqueConstraint) and constraint.condition is None\n 841         ]\n 842 \n 843     @cached_property\n 844     def _property_names(self):\n 847         for name in dir(self.model):\n 848             attr = inspect.getattr_static(self.model, name)\n 849             if isinstance(attr, property):\n 850                 names.append(name)\n 851         return frozenset(names)\n 852 \n 853     @cached_property\n 854     def db_returning_fields(self):\n 855         \"\"\"\n 856         Private API intended only to be used by Django itself.\n 857         Fields to be returned after a database insert.\n 860             field for field in self._get_fields(forward=True, reverse=False, include_parents=PROXY_PARENTS)\n</output>",
+      "timestamp": 1767239424.4655995
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Inspect file header to see existing imports so we can add UniqueConstraint import cleanly.\n@bug_localization\ndef print_query_file_header_to_edit():\n    return print_code_context('django/db/models/query.py', (1,160))",
+      "timestamp": 1767239429.7577205,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3zcUqWF6m4PdNJqZX2Vp4mhbPln",
+          "created": 1767239424,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Inspect file header to see existing imports so we can add UniqueConstraint import cleanly.\n@bug_localization\ndef print_query_file_header_to_edit():\n    return print_code_context('django/db/models/query.py', (1,160))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 251,
+            "prompt_tokens": 7552,
+            "total_tokens": 7803,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 192,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 6016,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n   1 \"\"\"\n   2 The main QuerySet implementation. This provides the public API for the ORM.\n   6 import operator\n   7 import warnings\n   8 from collections import namedtuple\n   9 from functools import lru_cache\n  10 from itertools import chain\n  11 \n  12 from django.conf import settings\n  13 from django.core import exceptions\n  14 from django.db import (\n  15     DJANGO_VERSION_PICKLE_KEY, IntegrityError, NotSupportedError, connections,\n  16     router, transaction,\n  17 )\n  18 from django.db.models import AutoField, DateField, DateTimeField, sql\n  19 from django.db.models.constants import LOOKUP_SEP\n  20 from django.db.models.deletion import Collector\n  21 from django.db.models.expressions import Case, Expression, F, Value, When\n  22 from django.db.models.functions import Cast, Trunc\n  23 from django.db.models.query_utils import FilteredRelation, Q\n  24 from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE\n  25 from django.db.models.utils import resolve_callables\n  26 from django.utils import timezone\n  27 from django.utils.functional import cached_property, partition\n  28 from django.utils.version import get_version\n  29 \n  31 MAX_GET_RESULTS = 21\n  32 \n  34 REPR_OUTPUT_SIZE = 20\n  35 \n  36 \n  37 class BaseIterable:\n  38     def __init__(self, queryset, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):\n  39         self.queryset = queryset\n  40         self.chunked_fetch = chunked_fetch\n  41         self.chunk_size = chunk_size\n  42 \n  43 \n  44 class ModelIterable(BaseIterable):\n  48         queryset = self.queryset\n  49         db = queryset.db\n  50         compiler = queryset.query.get_compiler(using=db)\n  53         results = compiler.execute_sql(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)\n  54         select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,\n  55                                                   compiler.annotation_col_map)\n  56         model_cls = klass_info['model']\n  57         select_fields = klass_info['select_fields']\n  58         model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1\n  59         init_list = [f[0].target.attname\n  60                      for f in select[model_fields_start:model_fields_end]]\n  61         related_populators = get_related_populators(klass_info, select, db)\n  62         known_related_objects = [\n  63             (field, related_objs, operator.attrgetter(*[\n  64                 field.attname\n  65                 if from_field == 'self' else\n  66                 queryset.model._meta.get_field(from_field).attname\n  67                 for from_field in field.from_fields\n  68             ])) for field, related_objs in queryset._known_related_objects.items()\n  69         ]\n  70         for row in compiler.results_iter(results):\n  71             obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])\n  72             for rel_populator in related_populators:\n  73                 rel_populator.populate(row, obj)\n  74             if annotation_col_map:\n  75                 for attr_name, col_pos in annotation_col_map.items():\n  76                     setattr(obj, attr_name, row[col_pos])\n  77 \n  79             for field, rel_objs, rel_getter in known_related_objects:\n  81                 if field.is_cached(obj):\n  82                     continue\n  83                 rel_obj_id = rel_getter(obj)\n  84                 try:\n  85                     rel_obj = rel_objs[rel_obj_id]\n  86                 except KeyError:\n  87                     pass  # May happen in qs1 | qs2 scenarios.\n  88                 else:\n  89                     setattr(obj, field.name, rel_obj)\n  90 \n  91             yield obj\n  92 \n  93 \n  94 class ValuesIterable(BaseIterable):\n  95     \"\"\"\n  96     Iterable returned by QuerySet.values() that yields a dict for each row.\n 100         queryset = self.queryset\n 101         query = queryset.query\n 102         compiler = query.get_compiler(queryset.db)\n 103 \n 105         names = [\n 106             *query.extra_select,\n 107             *query.values_select,\n 108             *query.annotation_select,\n 109         ]\n 110         indexes = range(len(names))\n 111         for row in compiler.results_iter(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size):\n 112             yield {names[i]: row[i] for i in indexes}\n 113 \n 114 \n 115 class ValuesListIterable(BaseIterable):\n 116     \"\"\"\n 117     Iterable returned by QuerySet.values_list(flat=False) that yields a tuple\n 118     for each row.\n 122         queryset = self.queryset\n 123         query = queryset.query\n 124         compiler = query.get_compiler(queryset.db)\n 125 \n 126         if queryset._fields:\n 128             names = [\n 129                 *query.extra_select,\n 130                 *query.values_select,\n 131                 *query.annotation_select,\n 132             ]\n 133             fields = [*queryset._fields, *(f for f in query.annotation_select if f not in queryset._fields)]\n 134             if fields != names:\n 136                 index_map = {name: idx for idx, name in enumerate(names)}\n 137                 rowfactory = operator.itemgetter(*[index_map[f] for f in fields])\n 138                 return map(\n 139                     rowfactory,\n 140                     compiler.results_iter(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)\n 141                 )\n 142         return compiler.results_iter(tuple_expected=True, chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)\n 143 \n 144 \n 145 class NamedValuesListIterable(ValuesListIterable):\n 146     \"\"\"\n 147     Iterable returned by QuerySet.values_list(named=True) that yields a\n 148     namedtuple for each row.\n 152     @lru_cache()\n 153     def create_namedtuple_class(*names):\n 156         return namedtuple('Row', names)\n 157 \n 158     def __iter__(self):\n 159         queryset = self.queryset\n 160         if queryset._fields:\n</output>",
+      "timestamp": 1767239430.045091
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Patch in_bulk to accept fields unique via UniqueConstraint by checking total_unique_constraints when field.unique is False.\n@patch_generation\ndef patch_query_in_bulk_to_accept_uniqueconstraints():\n    return exec_bash_cmd(\"\"\"python - <<'PY'\nfrom pathlib import Path\np=Path('django/db/models/query.py')\ns=p.read_text()\nold=\\\"\\\"\\\"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n\\\"\\\"\\\"\nnew=\\\"\\\"\\\"        if field_name != 'pk':\n            field = self.model._meta.get_field(field_name)\n            if not field.unique and not any(field_name in uc.fields for uc in self.model._meta.total_unique_constraints):\n                raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n\\\"\\\"\\\"\nif old in s:\n    s=s.replace(old,new)\n    p.write_text(s)\n    print('patched')\nelse:\n    print('pattern not found')\nPY\"\"\")",
+      "timestamp": 1767239456.6432586,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3zhYVBkdhAGdB71LQXCSGI0fvs0",
+          "created": 1767239429,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Patch in_bulk to accept fields unique via UniqueConstraint by checking total_unique_constraints when field.unique is False.\n@patch_generation\ndef patch_query_in_bulk_to_accept_uniqueconstraints():\n    return exec_bash_cmd(\"\"\"python - <<'PY'\nfrom pathlib import Path\np=Path('django/db/models/query.py')\ns=p.read_text()\nold=\\\"\\\"\\\"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n\\\"\\\"\\\"\nnew=\\\"\\\"\\\"        if field_name != 'pk':\n            field = self.model._meta.get_field(field_name)\n            if not field.unique and not any(field_name in uc.fields for uc in self.model._meta.total_unique_constraints):\n                raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n\\\"\\\"\\\"\nif old in s:\n    s=s.replace(old,new)\n    p.write_text(s)\n    print('patched')\nelse:\n    print('pattern not found')\nPY\"\"\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1398,
+            "prompt_tokens": 9064,
+            "total_tokens": 10462,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 1152,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 7040,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n patched\n\n</output>",
+      "timestamp": 1767239456.891685
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Run the specific in_bulk tests to verify the fix for field_name='slug'.\n@patch_verification\ndef run_in_bulk_tests_to_verify_patch():\n    return exec_bash_cmd('pytest -q tests/lookup/tests.py::LookupTests::test_in_bulk_with_field -q')",
+      "timestamp": 1767239468.162087,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct408MRjXoxl6oUzKZfgpW2udIpkK",
+          "created": 1767239456,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Run the specific in_bulk tests to verify the fix for field_name='slug'.\n@patch_verification\ndef run_in_bulk_tests_to_verify_patch():\n    return exec_bash_cmd('pytest -q tests/lookup/tests.py::LookupTests::test_in_bulk_with_field -q')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 197,
+            "prompt_tokens": 9332,
+            "total_tokens": 9529,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 128,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 8960,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \n==================================== ERRORS ====================================\n____________________ ERROR collecting tests/lookup/tests.py ____________________\ntests/lookup/tests.py:13: in <module>\n    from .models import (\ntests/lookup/models.py:11: in <module>\n    class Alarm(models.Model):\ndjango/db/models/base.py:108: in __new__\n    app_config = apps.get_containing_app_config(module)\ndjango/apps/registry.py:252: in get_containing_app_config\n    self.check_apps_ready()\ndjango/apps/registry.py:134: in check_apps_ready\n    settings.INSTALLED_APPS\ndjango/conf/__init__.py:77: in __getattr__\n    self._setup(name)\ndjango/conf/__init__.py:62: in _setup\n    % (desc, ENVIRONMENT_VARIABLE))\nE   django.core.exceptions.ImproperlyConfigured: Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.\n=========================== short test summary info ============================\nERROR tests/lookup/tests.py - django.core.exceptions.ImproperlyConfigured: Re...\nERROR: not found: /testbed/tests/lookup/tests.py::LookupTests::test_in_bulk_with_field\n(no name '/testbed/tests/lookup/tests.py::LookupTests::test_in_bulk_with_field' in any of [<Module tests.py>])\n\n\n</output>",
+      "timestamp": 1767239469.058059
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Create and run a small standalone script that simulates a model _meta to exercise the new uniqueness check path for a field unique via UniqueConstraint.\n@patch_verification\ndef run_repro_script_to_verify_in_bulk_change():\n    return exec_bash_cmd(\"\"\"cat > repro_in_bulk.py <<'PY'\nclass Field:\n    def __init__(self, name, unique=False):\n        self.name = name\n        self.unique = unique\n\nclass UniqueConstraintSim:\n    def __init__(self, fields):\n        self.fields = list(fields)\n\nclass MetaSim:\n    def __init__(self, fields, total_unique_constraints):\n        self._fields = {f.name: f for f in fields}\n        self.total_unique_constraints = [UniqueConstraintSim(c) for c in total_unique_constraints]\n    def get_field(self, name):\n        return self._fields[name]\n\nclass ModelSim:\n    def __init__(self, meta):\n        self._meta = meta\n\ndef check_in_bulk_field(model, field_name):\n    if field_name != 'pk':\n        field = model._meta.get_field(field_name)\n        if not field.unique and not any(field_name in uc.fields for uc in model._meta.total_unique_constraints):\n            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n\n# Case: field not unique=True but covered by a UniqueConstraint\nfields = [Field('id', unique=True), Field('slug', unique=False)]\ntotal_unique_constraints = [['slug']]\nmodel = ModelSim(MetaSim(fields, total_unique_constraints))\ntry:\n    check_in_bulk_field(model, 'slug')\n    print('OK: slug accepted as unique via UniqueConstraint')\nexcept Exception as e:\n    print('ERROR:', e)\n    raise SystemExit(1)\n\n# Case: non-unique field not covered by UniqueConstraint should raise\ntry:\n    check_in_bulk_field(model, 'id')  # id is unique -> should pass\n    print('OK: id accepted as unique field')\nexcept Exception as e:\n    print('ERROR id:', e)\n    raise SystemExit(1)\n\n# Case: another non-unique field without constraint\nfields.append(Field('title', unique=False))\nmodel2 = ModelSim(MetaSim(fields, total_unique_constraints))\ntry:\n    check_in_bulk_field(model2, 'title')\n    print('ERROR: title should have raised')\n    raise SystemExit(1)\nexcept ValueError:\n    print('OK: title correctly rejected as non-unique')\nPY\npython repro_in_bulk.py\n\"\"\")",
+      "timestamp": 1767239489.3099313,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct40LJYCMSCqFoqdRHlKu6kFCj2bk",
+          "created": 1767239469,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Create and run a small standalone script that simulates a model _meta to exercise the new uniqueness check path for a field unique via UniqueConstraint.\n@patch_verification\ndef run_repro_script_to_verify_in_bulk_change():\n    return exec_bash_cmd(\"\"\"cat > repro_in_bulk.py <<'PY'\nclass Field:\n    def __init__(self, name, unique=False):\n        self.name = name\n        self.unique = unique\n\nclass UniqueConstraintSim:\n    def __init__(self, fields):\n        self.fields = list(fields)\n\nclass MetaSim:\n    def __init__(self, fields, total_unique_constraints):\n        self._fields = {f.name: f for f in fields}\n        self.total_unique_constraints = [UniqueConstraintSim(c) for c in total_unique_constraints]\n    def get_field(self, name):\n        return self._fields[name]\n\nclass ModelSim:\n    def __init__(self, meta):\n        self._meta = meta\n\ndef check_in_bulk_field(model, field_name):\n    if field_name != 'pk':\n        field = model._meta.get_field(field_name)\n        if not field.unique and not any(field_name in uc.fields for uc in model._meta.total_unique_constraints):\n            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n\n# Case: field not unique=True but covered by a UniqueConstraint\nfields = [Field('id', unique=True), Field('slug', unique=False)]\ntotal_unique_constraints = [['slug']]\nmodel = ModelSim(MetaSim(fields, total_unique_constraints))\ntry:\n    check_in_bulk_field(model, 'slug')\n    print('OK: slug accepted as unique via UniqueConstraint')\nexcept Exception as e:\n    print('ERROR:', e)\n    raise SystemExit(1)\n\n# Case: non-unique field not covered by UniqueConstraint should raise\ntry:\n    check_in_bulk_field(model, 'id')  # id is unique -> should pass\n    print('OK: id accepted as unique field')\nexcept Exception as e:\n    print('ERROR id:', e)\n    raise SystemExit(1)\n\n# Case: another non-unique field without constraint\nfields.append(Field('title', unique=False))\nmodel2 = ModelSim(MetaSim(fields, total_unique_constraints))\ntry:\n    check_in_bulk_field(model2, 'title')\n    print('ERROR: title should have raised')\n    raise SystemExit(1)\nexcept ValueError:\n    print('OK: title correctly rejected as non-unique')\nPY\npython repro_in_bulk.py\n\"\"\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1499,
+            "prompt_tokens": 9705,
+            "total_tokens": 11204,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 960,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 6912,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n OK: slug accepted as unique via UniqueConstraint\nOK: id accepted as unique field\nOK: title correctly rejected as non-unique\n\n</output>",
+      "timestamp": 1767239489.5994916
+    },
+    {
+      "role": "assistant",
+      "content": "submit()",
+      "timestamp": 1767239496.3788233,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct40fCW9styyd3BDzF6qDEPCpwG6A",
+          "created": 1767239489,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "submit()",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 459,
+            "prompt_tokens": 10292,
+            "total_tokens": 10751,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 448,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 8960,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "diff --git a/django/db/models/query.py b/django/db/models/query.py\nindex d9c9b0db04..e8cf3e1e7e 100644\n--- a/django/db/models/query.py\n+++ b/django/db/models/query.py\n@@ -689,8 +689,10 @@ class QuerySet:\n         \"\"\"\n         assert not self.query.is_sliced, \\\n             \"Cannot use 'limit' or 'offset' with in_bulk\"\n-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n-            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+        if field_name != 'pk':\n+            field = self.model._meta.get_field(field_name)\n+            if not field.unique and not any(field_name in uc.fields for uc in self.model._meta.total_unique_constraints):\n+                raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n         if id_list is not None:\n             if not id_list:\n                 return {}\ndiff --git a/repro_in_bulk.py b/repro_in_bulk.py\nnew file mode 100644\nindex 0000000000..12290b8415\n--- /dev/null\n+++ b/repro_in_bulk.py\n@@ -0,0 +1,54 @@\n+class Field:\n+    def __init__(self, name, unique=False):\n+        self.name = name\n+        self.unique = unique\n+\n+class UniqueConstraintSim:\n+    def __init__(self, fields):\n+        self.fields = list(fields)\n+\n+class MetaSim:\n+    def __init__(self, fields, total_unique_constraints):\n+        self._fields = {f.name: f for f in fields}\n+        self.total_unique_constraints = [UniqueConstraintSim(c) for c in total_unique_constraints]\n+    def get_field(self, name):\n+        return self._fields[name]\n+\n+class ModelSim:\n+    def __init__(self, meta):\n+        self._meta = meta\n+\n+def check_in_bulk_field(model, field_name):\n+    if field_name != 'pk':\n+        field = model._meta.get_field(field_name)\n+        if not field.unique and not any(field_name in uc.fields for uc in model._meta.total_unique_constraints):\n+            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+\n+# Case: field not unique=True but covered by a UniqueConstraint\n+fields = [Field('id', unique=True), Field('slug', unique=False)]\n+total_unique_constraints = [['slug']]\n+model = ModelSim(MetaSim(fields, total_unique_constraints))\n+try:\n+    check_in_bulk_field(model, 'slug')\n+    print('OK: slug accepted as unique via UniqueConstraint')\n+except Exception as e:\n+    print('ERROR:', e)\n+    raise SystemExit(1)\n+\n+# Case: non-unique field not covered by UniqueConstraint should raise\n+try:\n+    check_in_bulk_field(model, 'id')  # id is unique -> should pass\n+    print('OK: id accepted as unique field')\n+except Exception as e:\n+    print('ERROR id:', e)\n+    raise SystemExit(1)\n+\n+# Case: another non-unique field without constraint\n+fields.append(Field('title', unique=False))\n+model2 = ModelSim(MetaSim(fields, total_unique_constraints))\n+try:\n+    check_in_bulk_field(model2, 'title')\n+    print('ERROR: title should have raised')\n+    raise SystemExit(1)\n+except ValueError:\n+    print('OK: title correctly rejected as non-unique')\n\n",
+      "timestamp": 1767239497.544338
+    }
+  ],
+  "trajectory_format": "mini-swe-agent-1",
+  "instance_id": "django__django-12774"
+}

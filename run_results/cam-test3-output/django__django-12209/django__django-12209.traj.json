@@ -1,0 +1,794 @@
+{
+  "info": {
+    "exit_status": "Submitted",
+    "submission": "diff --git a/comprehensive_repro.py b/comprehensive_repro.py\nnew file mode 100644\nindex 0000000000..6b8952fbd1\n--- /dev/null\n+++ b/comprehensive_repro.py\n@@ -0,0 +1,58 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+\n+from django.db import models, connection\n+\n+def run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n+    create_kwargs = create_kwargs or {}\n+    new_instance_kwargs = new_instance_kwargs or {}\n+    with connection.schema_editor() as schema_editor:\n+        schema_editor.create_model(model_cls)\n+    connection.queries_log.clear()\n+    s0 = model_cls.objects.create(**create_kwargs)\n+    connection.queries_log.clear()\n+    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n+    s1.save(raw=raw)\n+    qs = connection.queries\n+    sqls = [q['sql'].upper() for q in qs]\n+    insert = any('INSERT INTO' in s for s in sqls)\n+    update = any('UPDATE' in s for s in sqls)\n+    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n+    for obj in model_cls.objects.all():\n+        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n+\n+class MDefault(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app'\n+\n+class MNoDefault(models.Model):\n+    id = models.UUIDField(primary_key=True)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app2'\n+\n+# Scenario 1: default present, create without pk, then create new instance with same pk -> should UPDATE\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n+\n+# Scenario 1b: default present, raw=True save -> should also UPDATE\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n+\n+# Scenario 2: no default: create with explicit pk, then create new instance with same pk -> should UPDATE\n+pk = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n+\n+# Scenario 2b: no default, raw=True\n+pk2 = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\ndiff --git a/comprehensive_repro_fixed.py b/comprehensive_repro_fixed.py\nnew file mode 100644\nindex 0000000000..d7579bbc96\n--- /dev/null\n+++ b/comprehensive_repro_fixed.py\n@@ -0,0 +1,60 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+\n+from django.db import models, connection\n+\n+class MDefault(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app'\n+\n+class MNoDefault(models.Model):\n+    id = models.UUIDField(primary_key=True)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app2'\n+\n+from django.db import connection\n+with connection.schema_editor() as schema_editor:\n+    schema_editor.create_model(MDefault)\n+    schema_editor.create_model(MNoDefault)\n+\n+def run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n+    create_kwargs = create_kwargs or {}\n+    new_instance_kwargs = new_instance_kwargs or {}\n+    model_cls.objects.all().delete()\n+    connection.queries.clear()\n+    s0 = model_cls.objects.create(**create_kwargs)\n+    model_cls.objects.all().delete()  # ensure only s0 influenced via pk, then clear so save_base will act on DB\n+    connection.queries.clear()\n+    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n+    s1.save_base(raw=raw)\n+    sqls = [q['sql'].upper() for q in connection.queries]\n+    insert = any('INSERT INTO' in s for s in sqls)\n+    update = any('UPDATE' in s for s in sqls)\n+    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n+    for obj in model_cls.objects.all():\n+        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n+\n+# Scenario 1: default present, create without pk, then save instance with same pk -> should UPDATE, not INSERT\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n+# Scenario 1b: default present, raw=True\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n+\n+# Scenario 2: no default: create with explicit pk, then save new instance with same pk -> should UPDATE\n+pk = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n+# Scenario 2b: no default, raw=True\n+pk2 = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\ndiff --git a/django/db/models/base.py b/django/db/models/base.py\nindex e3b14a41a0..f9c2f51790 100644\n--- a/django/db/models/base.py\n+++ b/django/db/models/base.py\n@@ -850,7 +850,7 @@ class Model(metaclass=ModelBase):\n         # Skip an UPDATE when adding an instance and primary key has a default.\n         if (\n             not force_insert and\n-            self._state.adding and\n+            self._state.adding and not pk_set and\n             self._meta.pk.default and\n             self._meta.pk.default is not NOT_PROVIDED\n         ):\n@@ -1099,7 +1099,7 @@ class Model(metaclass=ModelBase):\n             # allows single model to have effectively multiple primary keys.\n             # Refs #17615.\n             model_class_pk = self._get_pk_val(model_class._meta)\n-            if not self._state.adding and model_class_pk is not None:\n+            if not self._state.adding and not pk_set and model_class_pk is not None:\n                 qs = qs.exclude(pk=model_class_pk)\n             if qs.exists():\n                 if len(unique_check) == 1:\n@@ -1130,7 +1130,7 @@ class Model(metaclass=ModelBase):\n             qs = model_class._default_manager.filter(**lookup_kwargs)\n             # Exclude the current object from the query if we are editing an\n             # instance (as opposed to creating a new one)\n-            if not self._state.adding and self.pk is not None:\n+            if not self._state.adding and not pk_set and self.pk is not None:\n                 qs = qs.exclude(pk=self.pk)\n \n             if qs.exists():\ndiff --git a/repro_save_pk.py b/repro_save_pk.py\nnew file mode 100644\nindex 0000000000..ba9126e40c\n--- /dev/null\n+++ b/repro_save_pk.py\n@@ -0,0 +1,33 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+\n+from django.db import models, connection\n+\n+class Sample(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+\n+    class Meta:\n+        app_label = \"tests_app\"\n+\n+with connection.schema_editor() as schema_editor:\n+    schema_editor.create_model(Sample)\n+\n+s0 = Sample.objects.create()\n+print(\"s0:\", s0.pk)\n+s1 = Sample(pk=s0.pk, name=\"Test 1\")\n+s1.save()\n+print(\"s1 after save pk:\", s1.pk)\n+print(\"count:\", Sample.objects.count())\n+for obj in Sample.objects.all():\n+    print(\"row:\", obj.pk, obj.name)\ndiff --git a/verify_patch.py b/verify_patch.py\nnew file mode 100644\nindex 0000000000..5ebdd35591\n--- /dev/null\n+++ b/verify_patch.py\n@@ -0,0 +1,33 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+from django.db import models, connection\n+\n+class Sample(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app'\n+\n+with connection.schema_editor() as schema_editor:\n+    schema_editor.create_model(Sample)\n+\n+connection.queries.clear()\n+s0 = Sample.objects.create()\n+connection.queries.clear()\n+s1 = Sample(pk=s0.pk, name='Test 1')\n+s1.save()\n+for q in connection.queries:\n+    print(q['sql'])\n+print(\"count:\", Sample.objects.count())\n+for obj in Sample.objects.all():\n+    print(\"row:\", obj.pk, obj.name)\n\n",
+    "model_stats": {
+      "instance_cost": 0.020093599999999996,
+      "api_calls": 13
+    },
+    "mini_version": "1.17.3",
+    "config": {
+      "agent": {
+        "system_template": "You are an ultra token & round-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage and interactive turns. Each of your output is executable python code formated as follows.\n\n  <format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence of reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nCRITICAL STRATEGY: \"Search First, Navigate Later\"\n\nYou must immediately hypothesize the location of the bug based on the Issue Description and use `grep` to pinpoint the exact file and line number when the bug location can be inferred from issue. If you need to understand the structure of codebase first, use 'ls -la'.\n\n## Localization Workflow\n1. **Analyze:** Read the issue to extract key terms (Function names, Class names, Error messages, or unique logic keywords).\n2. **Hypothesize:** If no specific name is given, guess the likely function name (e.g., if the issue is about \"login failure\", guess `login`, `auth`, or `authenticate`).\n3. **Search:** Use `grep -RIn` (or `grep -RInE` for regex) to find definitions or references. **Crucial:** Narrow down your search by specifying file extensions (e.g., `*.py`) and specific directories (e.g., `src/utils`) whenever the context allows.\n4. **Verify:** Only read the specific file content once you have a grep hit.\n\n## Command Best Practices\n- **Standard Search:** `grep -RIn \"Pattern\" .` (Always include line numbers `-n` and ignore binary `-I`).\n- **Filter by File Extension (Highly Recommended):** Use `--include` to avoid noise and save tokens.\n  - Python only: `grep -RIn --include=\"*.py\" \"Pattern\" .`\n  - Java only: `grep -RIn --include=\"*.java\" \"Pattern\" .`\n  - C/C++: `grep -RIn --include=\"*.{c,h,cpp}\" \"Pattern\" .`\n- **Target Specific Directory:** If the issue clearly points to a module (e.g., \"frontend\", \"utils\"), replace `.` with the specific path.\n  - Example: `grep -RIn \"Pattern\" src/utils`\n- **Complex Patterns:** `grep -RInE \"PatternA|PatternB\" .`\n- **Definitions:**\n  - Function: `grep -RIn \"^def function_name\" .`\n  - Class: `grep -RIn \"^class ClassName\" .`\n  - Function Call: `grep -RIn \"^function_name(\" .`\n\n## Examples of Strategic Searching\n\n### Scenario 1: The issue explicitly names a function in a known language (e.g., \"Integer overflow in `calculate_budget` in the Python backend\")\n**Thought:** IFilter for `.py` files to avoid matching compiled files or logs.\n**Command:** `grep -RIn --include=\"*.py\" \"def calculate_budget\" .`\n\n### Scenario 2: The issue implies a specific module location (e.g., \"The `DateUtils` helper in the utility folder is parsing dates wrong\")\n**Thought:** The issue points to `utils` or a similar folder. Restrict the search to that directory to speed up the process and reduce noise.\n**Command:** `grep -RIn \"class DateUtils\" src/utils`\n\n### Scenario 3: Investigating a symptom in a specific component (e.g., \"Login page raises an error on button click\")\n**Thought:** This is likely a frontend issue or a views issue. Search for \"login\" logic specifically in the `views` or `frontend` directory, and I am looking for Python files.\n**Command:** `grep -RIn --include=\"*.py\" -i \"login\" src/views`\n\n### Scenario 4: Broad search for keywords with file restrictions (e.g., \"JSON serialization fails during export\")\n**Thought:** No function name is given, but \"JSON\" and \"export\" are key. Look for functions that combine these concepts, restricting to `.py` files to filter out noise.\n**Command:** `grep -RInE --include=\"*.py\" \"json.*dump|export|serialize\" .`\n\n### Scenario 5: Tracing a call site in a test file (e.g., \"The test `test_process_payment` is failing\")\n**Thought:** Find the test definition. It is likely in a `tests` directory.\n**Command:** `grep -RIn \"def test_process_payment\" tests/`\n\n---\n**ACTION REQUIRED:**\nBased on the current issue description, generate your hypothesis, construct a precise `grep` command (using `--include` and specific paths if possible), and execute it immediately.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)];\n2. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path;\n3. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code or patch code replacement;\n4. save_code_to_file(file_path: str, code: str,): tool used to save code to file_path, for example, creating testing scripts;\n5. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\n## Other Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.\n",
+        "instance_template": "<pr_description>\nConsider the following PR description:\n{{task}}\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>\n",
+        "timeout_template": "The last action timed out and has been killed.\nThe output of the action was:\n{% if output | length < 10000 -%}\n<output>\n{{output}}\n</output>\n{%- else -%}\n<warning>Output was too long and has been truncated.</warning>\n<output_head>\n{{ output[:5000] }}\n</output_head>\n<elided_chars>{{ output | length - 10000 }} characters elided</elided_chars>\n<output_tail>\n{{ output[-5000:] }}\n</output_tail>\n{%- endif %}\nPlease try another command and make sure to avoid those requiring interactive input.\n",
+        "format_error_template": "Please always provide EXACTLY ONE action in triple backticks, found actions.\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).\n",
+        "action_observation_template": "<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n",
+        "action_regex": "```bash\\s*\\n(.*?)\\n```",
+        "step_limit": 100,
+        "cost_limit": 0.2
+      },
+      "model": {
+        "model_name": "openai/gpt-5-mini",
+        "model_kwargs": {},
+        "litellm_model_registry": null,
+        "set_cache_control": null,
+        "cost_tracking": "default"
+      },
+      "environment": {
+        "image": "docker.io/swebench/sweb.eval.x86_64.django_1776_django-12209:latest",
+        "cwd": "/testbed",
+        "env": {
+          "PAGER": "cat",
+          "MANPAGER": "cat",
+          "LESS": "-R",
+          "PIP_PROGRESS_BAR": "off",
+          "TQDM_DISABLE": "1"
+        },
+        "forward_env": [],
+        "timeout": 60,
+        "executable": "docker",
+        "run_args": [
+          "--rm"
+        ],
+        "container_timeout": "2h",
+        "pull_timeout": 120
+      },
+      "agent_type": "minisweagent.run.extra.swebench_cam.ProgressTrackingAgent",
+      "model_type": "minisweagent.models.litellm_model.LitellmModel",
+      "environment_type": "minisweagent.environments.docker_cam.DockerEnvironmentCam"
+    }
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an ultra token & round-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage and interactive turns. Each of your output is executable python code formated as follows.\n\n  <format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence of reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nCRITICAL STRATEGY: \"Search First, Navigate Later\"\n\nYou must immediately hypothesize the location of the bug based on the Issue Description and use `grep` to pinpoint the exact file and line number when the bug location can be inferred from issue. If you need to understand the structure of codebase first, use 'ls -la'.\n\n## Localization Workflow\n1. **Analyze:** Read the issue to extract key terms (Function names, Class names, Error messages, or unique logic keywords).\n2. **Hypothesize:** If no specific name is given, guess the likely function name (e.g., if the issue is about \"login failure\", guess `login`, `auth`, or `authenticate`).\n3. **Search:** Use `grep -RIn` (or `grep -RInE` for regex) to find definitions or references. **Crucial:** Narrow down your search by specifying file extensions (e.g., `*.py`) and specific directories (e.g., `src/utils`) whenever the context allows.\n4. **Verify:** Only read the specific file content once you have a grep hit.\n\n## Command Best Practices\n- **Standard Search:** `grep -RIn \"Pattern\" .` (Always include line numbers `-n` and ignore binary `-I`).\n- **Filter by File Extension (Highly Recommended):** Use `--include` to avoid noise and save tokens.\n  - Python only: `grep -RIn --include=\"*.py\" \"Pattern\" .`\n  - Java only: `grep -RIn --include=\"*.java\" \"Pattern\" .`\n  - C/C++: `grep -RIn --include=\"*.{c,h,cpp}\" \"Pattern\" .`\n- **Target Specific Directory:** If the issue clearly points to a module (e.g., \"frontend\", \"utils\"), replace `.` with the specific path.\n  - Example: `grep -RIn \"Pattern\" src/utils`\n- **Complex Patterns:** `grep -RInE \"PatternA|PatternB\" .`\n- **Definitions:**\n  - Function: `grep -RIn \"^def function_name\" .`\n  - Class: `grep -RIn \"^class ClassName\" .`\n  - Function Call: `grep -RIn \"^function_name(\" .`\n\n## Examples of Strategic Searching\n\n### Scenario 1: The issue explicitly names a function in a known language (e.g., \"Integer overflow in `calculate_budget` in the Python backend\")\n**Thought:** IFilter for `.py` files to avoid matching compiled files or logs.\n**Command:** `grep -RIn --include=\"*.py\" \"def calculate_budget\" .`\n\n### Scenario 2: The issue implies a specific module location (e.g., \"The `DateUtils` helper in the utility folder is parsing dates wrong\")\n**Thought:** The issue points to `utils` or a similar folder. Restrict the search to that directory to speed up the process and reduce noise.\n**Command:** `grep -RIn \"class DateUtils\" src/utils`\n\n### Scenario 3: Investigating a symptom in a specific component (e.g., \"Login page raises an error on button click\")\n**Thought:** This is likely a frontend issue or a views issue. Search for \"login\" logic specifically in the `views` or `frontend` directory, and I am looking for Python files.\n**Command:** `grep -RIn --include=\"*.py\" -i \"login\" src/views`\n\n### Scenario 4: Broad search for keywords with file restrictions (e.g., \"JSON serialization fails during export\")\n**Thought:** No function name is given, but \"JSON\" and \"export\" are key. Look for functions that combine these concepts, restricting to `.py` files to filter out noise.\n**Command:** `grep -RInE --include=\"*.py\" \"json.*dump|export|serialize\" .`\n\n### Scenario 5: Tracing a call site in a test file (e.g., \"The test `test_process_payment` is failing\")\n**Thought:** Find the test definition. It is likely in a `tests` directory.\n**Command:** `grep -RIn \"def test_process_payment\" tests/`\n\n---\n**ACTION REQUIRED:**\nBased on the current issue description, generate your hypothesis, construct a precise `grep` command (using `--include` and specific paths if possible), and execute it immediately.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)];\n2. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path;\n3. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code or patch code replacement;\n4. save_code_to_file(file_path: str, code: str,): tool used to save code to file_path, for example, creating testing scripts;\n5. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\n## Other Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.",
+      "timestamp": 1767237668.3973203
+    },
+    {
+      "role": "user",
+      "content": "<pr_description>\nConsider the following PR description:\nChange in behaviour when saving a model instance with an explcit pk value if the pk field has a default\nDescription\n\t \n\t\t(last modified by Reupen Shah)\n\t \nConsider the following model:\nfrom uuid import uuid4\nfrom django.db import models\nclass Sample(models.Model):\n\tid = models.UUIDField(primary_key=True, default=uuid4)\n\tname = models.CharField(blank=True, max_length=100)\nIn Django 2.2 and earlier, the following commands would result in an INSERT followed by an UPDATE:\ns0 = Sample.objects.create()\ns1 = Sample(pk=s0.pk, name='Test 1')\ns1.save()\nHowever, in Django 3.0, this results in two INSERTs (naturally the second one fails). The behaviour also changes if default=uuid4 is removed from the id field.\nThis seems related to https://code.djangoproject.com/ticket/29260.\nThe change in behaviour also has the side effect of changing the behaviour of the loaddata management command when the fixture contains explicit pk values and the objects already exist (e.g. when loading the fixture multiple times).\nPerhaps the intention was to only change the behaviour if an explicit pk value was not set on the model instance being saved? (At least, that would be more backwards-compatible behaviour...)\n\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>",
+      "timestamp": 1767237668.3978338
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search repository for model save handling and pk/default-related logic to locate bug area.\n@bug_localization\ndef grep_files_to_find_model_save_handling():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"save_base|def save\\\\(|pk\\\\s*=|primary_key=True|default=.*uuid4|loaddata|get_or_create\" testbed || true')",
+      "timestamp": 1767237673.414422,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XIpEIxy0BN3V2wDHm8kuFURMfW",
+          "created": 1767237668,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search repository for model save handling and pk/default-related logic to locate bug area.\n@bug_localization\ndef grep_files_to_find_model_save_handling():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"save_base|def save\\\\(|pk\\\\s*=|primary_key=True|default=.*uuid4|loaddata|get_or_create\" testbed || true')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 353,
+            "prompt_tokens": 2390,
+            "total_tokens": 2743,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 256,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n grep: testbed: No such file or directory\n\n</output>",
+      "timestamp": 1767237673.6755311
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Inspect repository root to find project files and locate Django-related code.\n@bug_localization\ndef list_root_files_to_find_project_dir():\n    return exec_bash_cmd('ls -la')",
+      "timestamp": 1767237675.5484195,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XNw7mQJx58VAMMnrli8DKAJd1I",
+          "created": 1767237673,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Inspect repository root to find project files and locate Django-related code.\n@bug_localization\ndef list_root_files_to_find_project_dir():\n    return exec_bash_cmd('ls -la')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 114,
+            "prompt_tokens": 2517,
+            "total_tokens": 2631,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 1792,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n total 172\ndrwxrwxrwx   1 root root  4096 Sep 10 10:34 .\ndrwxr-xr-x   1 root root  4096 Jan  1 03:21 ..\n-rw-r--r--   1 root root   782 Sep 10 10:27 .editorconfig\n-rw-r--r--   1 root root    86 Sep 10 10:27 .eslintignore\n-rw-r--r--   1 root root  1165 Sep 10 10:27 .eslintrc\ndrwxrwxrwx   8 root root  4096 Sep 10 10:34 .git\n-rw-r--r--   1 root root   297 Sep 10 10:27 .gitattributes\n-rw-r--r--   1 root root   353 Sep 10 10:27 .gitignore\n-rw-r--r--   1 root root   164 Sep 10 10:27 .hgignore\ndrwxrwxrwx   2 root root  4096 Sep 10 10:27 .tx\n-rw-r--r--   1 root root 36841 Sep 10 10:27 AUTHORS\n-rw-r--r--   1 root root  1115 Sep 10 10:27 CONTRIBUTING.rst\ndrwxr-xr-x   2 root root  4096 Sep 10 10:34 Django.egg-info\n-rw-r--r--   1 root root    51 Sep 10 10:27 FUNDING.yml\n-rw-r--r--   1 root root   353 Sep 10 10:27 Gruntfile.js\n-rw-r--r--   1 root root   236 Sep 10 10:27 INSTALL\n-rw-r--r--   1 root root  1552 Sep 10 10:27 LICENSE\n-rw-r--r--   1 root root 13221 Sep 10 10:27 LICENSE.python\n-rw-r--r--   1 root root   307 Sep 10 10:27 MANIFEST.in\n-rw-r--r--   1 root root  1900 Sep 10 10:27 README.rst\ndrwxrwxrwx  19 root root  4096 Sep 10 10:34 django\ndrwxrwxrwx  13 root root  4096 Sep 10 10:27 docs\ndrwxrwxrwx   2 root root  4096 Sep 10 10:27 extras\ndrwxrwxrwx   5 root root  4096 Sep 10 10:27 js_tests\n-rw-r--r--   1 root root   347 Sep 10 10:27 package.json\ndrwxrwxrwx   2 root root  4096 Sep 10 10:27 scripts\n-rw-r--r--   1 root root  2121 Sep 10 10:27 setup.cfg\n-rw-r--r--   1 root root  2368 Sep 10 10:27 setup.py\ndrwxrwxrwx 212 root root 12288 Sep 10 10:27 tests\n-rw-r--r--   1 root root  1535 Sep 10 10:27 tox.ini\n\n</output>",
+      "timestamp": 1767237675.81251
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search for save/save_base logic in django models to find where explicit PK with default is treated.\n@bug_localization\ndef grep_save_base_in_django_repo():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" \"def save_base\" django || true')",
+      "timestamp": 1767237680.912753,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XPW1F4IttGuFiksc06BHrpvJDW",
+          "created": 1767237675,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search for save/save_base logic in django models to find where explicit PK with default is treated.\n@bug_localization\ndef grep_save_base_in_django_repo():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" \"def save_base\" django || true')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 199,
+            "prompt_tokens": 3334,
+            "total_tokens": 3533,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 128,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n django/db/models/base.py:750:    def save_base(self, raw=False, force_insert=False,\n\n</output>",
+      "timestamp": 1767237681.78337
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Open the save_base implementation to inspect logic handling pk, defaults, force_insert/force_update behavior.\n@bug_localization\ndef print_save_base_implementation():\n    return print_code_context('django/db/models/base.py', (720, 820))",
+      "timestamp": 1767237684.4028485,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XW9oe3bVI6HMfSa8oFgr38aT0E",
+          "created": 1767237682,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Open the save_base implementation to inspect logic handling pk, defaults, force_insert/force_update behavior.\n@bug_localization\ndef print_save_base_implementation():\n    return print_code_context('django/db/models/base.py', (720, 820))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 126,
+            "prompt_tokens": 3446,
+            "total_tokens": 3572,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 64,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3328,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 720 \n 721             for field in self._meta.fields:\n 722                 if not field.primary_key:\n 723                     field_names.add(field.name)\n 724 \n 725                     if field.name != field.attname:\n 726                         field_names.add(field.attname)\n 727 \n 728             non_model_fields = update_fields.difference(field_names)\n 729 \n 730             if non_model_fields:\n 731                 raise ValueError(\"The following fields do not exist in this \"\n 732                                  \"model or are m2m fields: %s\"\n 733                                  % ', '.join(non_model_fields))\n 734 \n 737         elif not force_insert and deferred_fields and using == self._state.db:\n 738             field_names = set()\n 739             for field in self._meta.concrete_fields:\n 740                 if not field.primary_key and not hasattr(field, 'through'):\n 741                     field_names.add(field.attname)\n 742             loaded_fields = field_names.difference(deferred_fields)\n 743             if loaded_fields:\n 744                 update_fields = frozenset(loaded_fields)\n 745 \n 746         self.save_base(using=using, force_insert=force_insert,\n 747                        force_update=force_update, update_fields=update_fields)\n 748     save.alters_data = True\n 749 \n 750     def save_base(self, raw=False, force_insert=False,\n 751                   force_update=False, using=None, update_fields=None):\n 752         \"\"\"\n 753         Handle the parts of saving which should be done only once per save,\n 754         yet need to be done in raw saves, too. This includes some sanity\n 755         checks and signal sending.\n 756 \n 757         The 'raw' argument is telling save_base not to save any parent\n 758         models and not to do any changes to the values before save. This\n 759         is used by fixture loading.\n 762         assert not (force_insert and (force_update or update_fields))\n 763         assert update_fields is None or update_fields\n 764         cls = origin = self.__class__\n 766         if cls._meta.proxy:\n 767             cls = cls._meta.concrete_model\n 768         meta = cls._meta\n 769         if not meta.auto_created:\n 770             pre_save.send(\n 771                 sender=origin, instance=self, raw=raw, using=using,\n 772                 update_fields=update_fields,\n 773             )\n 775         if meta.parents:\n 776             context_manager = transaction.atomic(using=using, savepoint=False)\n 777         else:\n 778             context_manager = transaction.mark_for_rollback_on_error(using=using)\n 779         with context_manager:\n 780             parent_inserted = False\n 781             if not raw:\n 782                 parent_inserted = self._save_parents(cls, using, update_fields)\n 783             updated = self._save_table(\n 784                 raw, cls, force_insert or parent_inserted,\n 785                 force_update, using, update_fields,\n 786             )\n 788         self._state.db = using\n 790         self._state.adding = False\n 791 \n 793         if not meta.auto_created:\n 794             post_save.send(\n 795                 sender=origin, instance=self, created=(not updated),\n 796                 update_fields=update_fields, raw=raw, using=using,\n 797             )\n 798 \n 799     save_base.alters_data = True\n 800 \n 801     def _save_parents(self, cls, using, update_fields):\n 804         inserted = False\n 805         for parent, field in meta.parents.items():\n 807             if (field and getattr(self, parent._meta.pk.attname) is None and\n 808                     getattr(self, field.attname) is not None):\n 809                 setattr(self, parent._meta.pk.attname, getattr(self, field.attname))\n 810             parent_inserted = self._save_parents(cls=parent, using=using, update_fields=update_fields)\n 811             updated = self._save_table(\n 812                 cls=parent, using=using, update_fields=update_fields,\n 813                 force_insert=parent_inserted,\n 814             )\n 815             if not updated:\n 816                 inserted = True\n 818             if field:\n 819                 setattr(self, field.attname, self._get_pk_val(parent._meta))\n</output>",
+      "timestamp": 1767237684.611648
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Locate _save_table implementation to inspect logic that decides inserts vs updates.\n@bug_localization\ndef grep_save_table_definition():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" \"def _save_table\" django | sed -n \\'1,120p\\'')",
+      "timestamp": 1767237685.9028156,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XYED4Vfq2yHCqYQEKANi7opojX",
+          "created": 1767237684,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Locate _save_table implementation to inspect logic that decides inserts vs updates.\n@bug_localization\ndef grep_save_table_definition():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" \"def _save_table\" django | sed -n \\'1,120p\\'')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 72,
+            "prompt_tokens": 4456,
+            "total_tokens": 4528,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 0,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 2816,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n django/db/models/base.py:829:    def _save_table(self, raw=False, cls=None, force_insert=False,\n\n</output>",
+      "timestamp": 1767237686.1473525
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Open _save_table in base.py to inspect insert/update determination logic.\n@bug_localization\ndef print_save_table_implementation():\n    return print_code_context('django/db/models/base.py', (820, 1000))",
+      "timestamp": 1767237687.7414615,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XaULPrBvKj5IdGhLuwYtoZ8s7z",
+          "created": 1767237686,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Open _save_table in base.py to inspect insert/update determination logic.\n@bug_localization\ndef print_save_table_implementation():\n    return print_code_context('django/db/models/base.py', (820, 1000))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 57,
+            "prompt_tokens": 4573,
+            "total_tokens": 4630,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 0,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 2816,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n 825                 if field.is_cached(self):\n 826                     field.delete_cached_value(self)\n 827         return inserted\n 828 \n 829     def _save_table(self, raw=False, cls=None, force_insert=False,\n 830                     force_update=False, using=None, update_fields=None):\n 831         \"\"\"\n 832         Do the heavy-lifting involved in saving. Update or insert the data\n 833         for a single table.\n 836         non_pks = [f for f in meta.local_concrete_fields if not f.primary_key]\n 837 \n 838         if update_fields:\n 839             non_pks = [f for f in non_pks\n 840                        if f.name in update_fields or f.attname in update_fields]\n 841 \n 842         pk_val = self._get_pk_val(meta)\n 843         if pk_val is None:\n 844             pk_val = meta.pk.get_pk_value_on_save(self)\n 845             setattr(self, meta.pk.attname, pk_val)\n 846         pk_set = pk_val is not None\n 847         if not pk_set and (force_update or update_fields):\n 848             raise ValueError(\"Cannot force an update in save() with no primary key.\")\n 849         updated = False\n 851         if (\n 852             not force_insert and\n 853             self._state.adding and\n 854             self._meta.pk.default and\n 855             self._meta.pk.default is not NOT_PROVIDED\n 856         ):\n 857             force_insert = True\n 859         if pk_set and not force_insert:\n 860             base_qs = cls._base_manager.using(using)\n 861             values = [(f, None, (getattr(self, f.attname) if raw else f.pre_save(self, False)))\n 862                       for f in non_pks]\n 863             forced_update = update_fields or force_update\n 864             updated = self._do_update(base_qs, using, pk_val, values, update_fields,\n 865                                       forced_update)\n 866             if force_update and not updated:\n 867                 raise DatabaseError(\"Forced update did not affect any rows.\")\n 868             if update_fields and not updated:\n 869                 raise DatabaseError(\"Save with update_fields did not affect any rows.\")\n 870         if not updated:\n 871             if meta.order_with_respect_to:\n 874                 field = meta.order_with_respect_to\n 875                 filter_args = field.get_filter_kwargs_for_object(self)\n 876                 self._order = cls._base_manager.using(using).filter(**filter_args).aggregate(\n 877                     _order__max=Coalesce(\n 878                         ExpressionWrapper(Max('_order') + Value(1), output_field=IntegerField()),\n 879                         Value(0),\n 880                     ),\n 881                 )['_order__max']\n 882             fields = meta.local_concrete_fields\n 883             if not pk_set:\n 884                 fields = [f for f in fields if f is not meta.auto_field]\n 885 \n 886             returning_fields = meta.db_returning_fields\n 887             results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)\n 888             for result, field in zip(results, returning_fields):\n 889                 setattr(self, field.attname, result)\n 890         return updated\n 891 \n 892     def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):\n 893         \"\"\"\n 894         Try to update the model. Return True if the model was updated (if an\n 895         update query was done and a matching row was found in the DB).\n 898         if not values:\n 904             return update_fields is not None or filtered.exists()\n 905         if self._meta.select_on_save and not forced_update:\n 906             return (\n 907                 filtered.exists() and\n 915                 (filtered._update(values) > 0 or filtered.exists())\n 916             )\n 917         return filtered._update(values) > 0\n 918 \n 919     def _do_insert(self, manager, using, fields, returning_fields, raw):\n 920         \"\"\"\n 921         Do an INSERT. If returning_fields is defined then this method should\n 922         return the newly created data for the model.\n 925             [self], fields=fields, returning_fields=returning_fields,\n 926             using=using, raw=raw,\n 927         )\n 928 \n 929     def delete(self, using=None, keep_parents=False):\n 930         using = using or router.db_for_write(self.__class__, instance=self)\n 931         assert self.pk is not None, (\n 932             \"%s object can't be deleted because its %s attribute is set to None.\" %\n 933             (self._meta.object_name, self._meta.pk.attname)\n 934         )\n 935 \n 936         collector = Collector(using=using)\n 937         collector.collect([self], keep_parents=keep_parents)\n 938         return collector.delete()\n 939 \n 940     delete.alters_data = True\n 941 \n 942     def _get_FIELD_display(self, field):\n 943         value = getattr(self, field.attname)\n 944         choices_dict = dict(make_hashable(field.flatchoices))\n 946         return force_str(choices_dict.get(make_hashable(value), value), strings_only=True)\n 947 \n 948     def _get_next_or_previous_by_FIELD(self, field, is_next, **kwargs):\n 949         if not self.pk:\n 950             raise ValueError(\"get_next/get_previous cannot be used on unsaved objects.\")\n 951         op = 'gt' if is_next else 'lt'\n 952         order = '' if is_next else '-'\n 953         param = getattr(self, field.attname)\n 954         q = Q(**{'%s__%s' % (field.name, op): param})\n 955         q = q | Q(**{field.name: param, 'pk__%s' % op: self.pk})\n 956         qs = self.__class__._default_manager.using(self._state.db).filter(**kwargs).filter(q).order_by(\n 957             '%s%s' % (order, field.name), '%spk' % order\n 958         )\n 959         try:\n 960             return qs[0]\n 961         except IndexError:\n 962             raise self.DoesNotExist(\"%s matching query does not exist.\" % self.__class__._meta.object_name)\n 963 \n 964     def _get_next_or_previous_in_order(self, is_next):\n 965         cachename = \"__%s_order_cache\" % is_next\n 966         if not hasattr(self, cachename):\n 967             op = 'gt' if is_next else 'lt'\n 968             order = '_order' if is_next else '-_order'\n 969             order_field = self._meta.order_with_respect_to\n 970             filter_args = order_field.get_filter_kwargs_for_object(self)\n 971             obj = self.__class__._default_manager.filter(**filter_args).filter(**{\n 972                 '_order__%s' % op: self.__class__._default_manager.values('_order').filter(**{\n 973                     self._meta.pk.name: self.pk\n 974                 })\n 975             }).order_by(order)[:1].get()\n 976             setattr(self, cachename, obj)\n 977         return getattr(self, cachename)\n 978 \n 979     def prepare_database_save(self, field):\n 980         if self.pk is None:\n 981             raise ValueError(\"Unsaved model instance %r cannot be used in an ORM query.\" % self)\n 982         return getattr(self, field.remote_field.get_related_field().attname)\n 983 \n 984     def clean(self):\n 985         \"\"\"\n 986         Hook for doing any extra model-wide validation after clean() has been\n 987         called on every field by self.clean_fields. Any ValidationError raised\n 988         by this method will not be associated with a particular field; it will\n 989         have a special-case association with the field defined by NON_FIELD_ERRORS.\n 992 \n 993     def validate_unique(self, exclude=None):\n 994         \"\"\"\n 995         Check unique constraints on the model and raise ValidationError if any\n 996         failed.\n 999 \n1000         errors = self._perform_unique_checks(unique_checks)\n</output>",
+      "timestamp": 1767237688.005492
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Insert check for explicit pk (pk_set) into condition that forces insert when pk field has a default.\n@patch_generation\ndef sed_edit_base_to_respect_explicit_pk():\n    return exec_bash_cmd(\"sed -i 's/self._state.adding and/self._state.adding and not pk_set and/g' django/db/models/base.py && nl -ba django/db/models/base.py | sed -n '840,900p'\")",
+      "timestamp": 1767237695.9681833,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XbYM6krMYZYcdx4yNAeTNtX2ae",
+          "created": 1767237687,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Insert check for explicit pk (pk_set) into condition that forces insert when pk field has a default.\n@patch_generation\ndef sed_edit_base_to_respect_explicit_pk():\n    return exec_bash_cmd(\"sed -i 's/self._state.adding and/self._state.adding and not pk_set and/g' django/db/models/base.py && nl -ba django/db/models/base.py | sed -n '840,900p'\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 679,
+            "prompt_tokens": 6436,
+            "total_tokens": 7115,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 576,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3840,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n    840\t                       if f.name in update_fields or f.attname in update_fields]\n   841\t\n   842\t        pk_val = self._get_pk_val(meta)\n   843\t        if pk_val is None:\n   844\t            pk_val = meta.pk.get_pk_value_on_save(self)\n   845\t            setattr(self, meta.pk.attname, pk_val)\n   846\t        pk_set = pk_val is not None\n   847\t        if not pk_set and (force_update or update_fields):\n   848\t            raise ValueError(\"Cannot force an update in save() with no primary key.\")\n   849\t        updated = False\n   850\t        # Skip an UPDATE when adding an instance and primary key has a default.\n   851\t        if (\n   852\t            not force_insert and\n   853\t            self._state.adding and not pk_set and\n   854\t            self._meta.pk.default and\n   855\t            self._meta.pk.default is not NOT_PROVIDED\n   856\t        ):\n   857\t            force_insert = True\n   858\t        # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.\n   859\t        if pk_set and not force_insert:\n   860\t            base_qs = cls._base_manager.using(using)\n   861\t            values = [(f, None, (getattr(self, f.attname) if raw else f.pre_save(self, False)))\n   862\t                      for f in non_pks]\n   863\t            forced_update = update_fields or force_update\n   864\t            updated = self._do_update(base_qs, using, pk_val, values, update_fields,\n   865\t                                      forced_update)\n   866\t            if force_update and not updated:\n   867\t                raise DatabaseError(\"Forced update did not affect any rows.\")\n   868\t            if update_fields and not updated:\n   869\t                raise DatabaseError(\"Save with update_fields did not affect any rows.\")\n   870\t        if not updated:\n   871\t            if meta.order_with_respect_to:\n   872\t                # If this is a model with an order_with_respect_to\n   873\t                # autopopulate the _order field\n   874\t                field = meta.order_with_respect_to\n   875\t                filter_args = field.get_filter_kwargs_for_object(self)\n   876\t                self._order = cls._base_manager.using(using).filter(**filter_args).aggregate(\n   877\t                    _order__max=Coalesce(\n   878\t                        ExpressionWrapper(Max('_order') + Value(1), output_field=IntegerField()),\n   879\t                        Value(0),\n   880\t                    ),\n   881\t                )['_order__max']\n   882\t            fields = meta.local_concrete_fields\n   883\t            if not pk_set:\n   884\t                fields = [f for f in fields if f is not meta.auto_field]\n   885\t\n   886\t            returning_fields = meta.db_returning_fields\n   887\t            results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)\n   888\t            for result, field in zip(results, returning_fields):\n   889\t                setattr(self, field.attname, result)\n   890\t        return updated\n   891\t\n   892\t    def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):\n   893\t        \"\"\"\n   894\t        Try to update the model. Return True if the model was updated (if an\n   895\t        update query was done and a matching row was found in the DB).\n   896\t        \"\"\"\n   897\t        filtered = base_qs.filter(pk=pk_val)\n   898\t        if not values:\n   899\t            # We can end up here when saving a model in inheritance chain where\n   900\t            # update_fields doesn't target any field in current model. In that\n\n</output>",
+      "timestamp": 1767237696.2182972
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search tests for UUIDField/loaddata/save behavior to run a focused test or create reproduction.\n@bug_localization\ndef grep_tests_for_uuid_or_loaddata():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"UUIDField|loaddata|loaddata|fixture|uuid4|primary_key=True\" tests || true')",
+      "timestamp": 1767237700.4122028,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XkILdqu4mIpsKZQWhwouRG1TRL",
+          "created": 1767237696,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search tests for UUIDField/loaddata/save behavior to run a focused test or create reproduction.\n@bug_localization\ndef grep_tests_for_uuid_or_loaddata():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"UUIDField|loaddata|loaddata|fixture|uuid4|primary_key=True\" tests || true')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 347,
+            "prompt_tokens": 7391,
+            "total_tokens": 7738,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 256,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning><output_head>\nbash execution output:\n tests/m2m_regress/models.py:60:    id = models.CharField(primary_key=True, max_length=100)\ntests/generic_inline_admin/tests.py:102:        load content via a fixture (since the GenericForeignKey relies on\ntests/one_to_one/tests.py:287:        filtering reverse one-to-one relations with primary_key=True was\ntests/one_to_one/tests.py:288:        misbehaving. We test both (primary_key=True & False) cases here to\ntests/one_to_one/models.py:20:    place = models.OneToOneField(Place, models.CASCADE, primary_key=True)\ntests/one_to_one/models.py:58:    primary_key = models.CharField(max_length=10, primary_key=True)\ntests/one_to_one/models.py:81:    other = models.OneToOneField(Target, models.CASCADE, primary_key=True)\ntests/one_to_one/models.py:93:    target = models.OneToOneField(Target, models.CASCADE, to_field='name', primary_key=True)\ntests/generic_relations_regress/models.py:60:    account = models.IntegerField(primary_key=True)\ntests/generic_relations_regress/models.py:147:    name = models.CharField(primary_key=True, max_length=15)\ntests/admin_custom_urls/models.py:10:    name = models.CharField(max_length=50, primary_key=True)\ntests/proxy_models/tests.py:357:    def test_proxy_load_from_fixture(self):\ntests/proxy_models/tests.py:358:        management.call_command('loaddata', 'mypeople.json', verbosity=0)\ntests/prefetch_related/models.py:71:        primary_key=True,\ntests/prefetch_related/models.py:176:    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)\ntests/prefetch_related/models.py:296:    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)\ntests/prefetch_related/models.py:302:    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)\ntests/sites_framework/migrations/0001_initial.py:14:                ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),\ntests/sites_framework/migrations/0001_initial.py:26:                ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),\ntests/sites_framework/migrations/0001_initial.py:38:                ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),\ntests/migrations/test_migrations_plan/0001_initial.py:22:                ('id', models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_plan/0002_second.py:15:                ('id', models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_plan/0003_third.py:15:                ('id', models.AutoField(primary_key=True)),\ntests/migrations/test_multidb.py:49:            [(\"id\", models.AutoField(primary_key=True))],\ntests/migrations/test_migrations_atomic_operation/0001_initial.py:18:                (\"name\", models.CharField(primary_key=True, max_length=255)),\ntests/migrations/test_migrations_non_atomic/0001_initial.py:18:                (\"name\", models.CharField(primary_key=True, max_length=255)),\ntests/migrations/test_migrations_non_atomic/0001_initial.py:25:                (\"title\", models.CharField(primary_key=True, max_length=255)),\ntests/migrations/test_migrations_squashed/0001_squashed_0002.py:16:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_squashed/0001_squashed_0002.py:27:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_squashed/0001_initial.py:11:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_squashed/0001_initial.py:22:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_squashed/0002_second.py:19:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_add_many_to_many_field_initial/0001_initial.py:15:                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),\ntests/migrations/test_add_many_to_many_field_initial/0001_initial.py:21:                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),\ntests/migrations/test_migrations/0001_initial.py:12:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations/0001_initial.py:22:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations/0002_second.py:21:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_conflict/0002_conflicting_second.py:13:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_conflict/0001_initial.py:11:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_conflict/0001_initial.py:22:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_conflict/0002_second.py:19:                (\"id\", models.AutoField(primary_key=True)),\ntests/migrations/test_migrations_no_changes/\n</output_head>\n<elided_chars>\n103026 characters elided\n</elided_chars>\n<output_tail>\np_id', primary_key=True)\ntests/bulk_create/models.py:55:    two_letter_code = models.CharField(max_length=2, primary_key=True)\ntests/bulk_create/models.py:95:    uuid_field = models.UUIDField(null=True, default=uuid.uuid4)\ntests/auth_tests/test_models.py:33:    fixtures = ['regular.json']\ntests/auth_tests/test_models.py:42:    fixtures = ['natural.json']\ntests/auth_tests/test_views.py:436:        # instead of fixture\ntests/auth_tests/__init__.py:1:# The password for the fixture data users is 'password'\ntests/auth_tests/models/uuid_pk.py:11:        id = models.UUIDField(default=uuid.uuid4, primary_key=True)\ntests/aggregation_regress/tests.py:1437:        # Note that Adrian's age is 34 in the fixtures, and he has one book\ntests/aggregation_regress/models.py:62:    EntryID = models.AutoField(primary_key=True, db_column='Entry ID')\ntests/aggregation_regress/models.py:68:    ID = models.AutoField(primary_key=True)\ntests/aggregation_regress/models.py:78:    id = models.IntegerField(primary_key=True)\ntests/many_to_many/models.py:23:    id = models.BigAutoField(primary_key=True)\ntests/migrate_signals/custom_migrations/0001_initial.py:10:                (\"id\", models.AutoField(primary_key=True)),\ntests/select_related_onetoone/models.py:29:    user = models.OneToOneField(User, models.CASCADE, primary_key=True)\ntests/select_related_onetoone/models.py:67:    id2 = models.AutoField(primary_key=True)\ntests/queries/models.py:72:    date = models.DateTimeField(primary_key=True, auto_now_add=True)\ntests/queries/models.py:238:    details = models.OneToOneField(Detail, models.CASCADE, primary_key=True)\ntests/queries/models.py:244:    person = models.OneToOneField(Member, models.CASCADE, primary_key=True)\ntests/queries/models.py:251:    name = models.CharField(max_length=10, primary_key=True)\ntests/queries/models.py:263:    id = models.CharField(max_length=20, primary_key=True)\ntests/queries/models.py:600:    id = models.IntegerField(primary_key=True)\ntests/queries/models.py:649:    parentid = models.AutoField(primary_key=True)\ntests/queries/models.py:655:    childid = models.AutoField(primary_key=True)\ntests/queries/models.py:749:    created = CreatedField(editable=False, primary_key=True)\ntests/schema/tests.py:18:    UUIDField,\ntests/schema/tests.py:347:            id = CharField(max_length=255, primary_key=True)\ntests/schema/tests.py:356:        new_field = AutoField(primary_key=True)\ntests/schema/tests.py:439:        new_field = BigAutoField(primary_key=True)\ntests/schema/tests.py:677:        new_field = IntegerField(primary_key=True)\ntests/schema/tests.py:689:        new_field = CharField(primary_key=True, max_length=50)\ntests/schema/tests.py:698:            id = AutoField(primary_key=True, db_column='\"quoted_id\"')\ntests/schema/tests.py:707:        new_field = BigAutoField(primary_key=True)\ntests/schema/tests.py:719:        # Change UUIDField to primary key.\ntests/schema/tests.py:721:        new_field = UUIDField(primary_key=True)\ntests/schema/tests.py:739:        new_field = BigAutoField(primary_key=True)\ntests/schema/tests.py:1275:        new_field = AutoField(primary_key=True)\ntests/schema/tests.py:1287:        Converting an implicit PK to BigAutoField(primary_key=True) should keep\ntests/schema/tests.py:1293:        new_field = BigAutoField(primary_key=True)\ntests/schema/tests.py:1309:        Converting an implicit PK to SmallAutoField(primary_key=True) should\ntests/schema/tests.py:1315:        new_field = SmallAutoField(primary_key=True)\ntests/schema/tests.py:1331:        Should be able to rename an IntegerField(primary_key=True) to\ntests/schema/tests.py:1332:        AutoField(primary_key=True).\ntests/schema/tests.py:1338:        new_field = AutoField(primary_key=True)\ntests/schema/tests.py:1347:        Should be able to rename an IntegerField(primary_key=True) to\ntests/schema/tests.py:1348:        BigAutoField(primary_key=True).\ntests/schema/tests.py:1354:        new_field = BigAutoField(primary_key=True)\ntests/schema/tests.py:1364:        Should be able to rename an SmallIntegerField(primary_key=True) to\ntests/schema/tests.py:1365:        SmallAutoField(primary_key=True).\ntests/schema/tests.py:1368:            i = SmallIntegerField(primary_key=True)\ntests/schema/tests.py:1377:        new_field = SmallAutoField(primary_key=True)\ntests/schema/tests.py:1385:        Should be able to rename an IntegerField(primary_key=True) to\ntests/schema/tests.py:1416:        new_field = IntegerField(primary_key=True)\ntests/schema/tests.py:1426:            j = IntegerField(primary_key=True)\ntests/schema/tests.py:2443:        new_field = SlugField(primary_key=True)\ntests/schema/tests.py:2956:        new_field = AutoField(primary_key=True)\ntests/schema/models.py:15:    uuid = models.UUIDField(null=True)\ntests/schema/models.py:151:    i = models.IntegerField(primary_key=True)\ntests/schema/models.py:210:    when = models.CharField(max_length=1, primary_key=True)\ntests/schema/models.py:229:    node_id = models.AutoField(primary_key=True)\n\n\n</output_tail>",
+      "timestamp": 1767237701.0775762
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Create a small standalone Django script that reproduces the issue using an in-memory SQLite DB and run it.\n@bug_reproduction\ndef create_and_run_repro_script():\n    code = r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\n\nfrom django.db import models, connection\n\nclass Sample(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n\n    class Meta:\n        app_label = \"tests_app\"\n\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(Sample)\n\ns0 = Sample.objects.create()\nprint(\"s0:\", s0.pk)\ns1 = Sample(pk=s0.pk, name=\"Test 1\")\ns1.save()\nprint(\"s1 after save pk:\", s1.pk)\nprint(\"count:\", Sample.objects.count())\nfor obj in Sample.objects.all():\n    print(\"row:\", obj.pk, obj.name)\n'''\n    save_code_to_file('repro_save_pk.py', code)\n    return exec_bash_cmd('python3 repro_save_pk.py')",
+      "timestamp": 1767237711.3961449,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3XpjC0S5dRX3de2FR4Iu0VVOS8e",
+          "created": 1767237701,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Create a small standalone Django script that reproduces the issue using an in-memory SQLite DB and run it.\n@bug_reproduction\ndef create_and_run_repro_script():\n    code = r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\n\nfrom django.db import models, connection\n\nclass Sample(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n\n    class Meta:\n        app_label = \"tests_app\"\n\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(Sample)\n\ns0 = Sample.objects.create()\nprint(\"s0:\", s0.pk)\ns1 = Sample(pk=s0.pk, name=\"Test 1\")\ns1.save()\nprint(\"s1 after save pk:\", s1.pk)\nprint(\"count:\", Sample.objects.count())\nfor obj in Sample.objects.all():\n    print(\"row:\", obj.pk, obj.name)\n'''\n    save_code_to_file('repro_save_pk.py', code)\n    return exec_bash_cmd('python3 repro_save_pk.py')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1057,
+            "prompt_tokens": 10006,
+            "total_tokens": 11063,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 768,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 6016,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n s0: aabf1bd4-62d4-4fda-a870-bd4d1b936ad2\ns1 after save pk: aabf1bd4-62d4-4fda-a870-bd4d1b936ad2\ncount: 1\nrow: aabf1bd4-62d4-4fda-a870-bd4d1b936ad2 Test 1\n\n</output>",
+      "timestamp": 1767237712.0670245
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Create comprehensive repro script that checks SQL executed (INSERT vs UPDATE) for explicit pk with/without default and raw save case.\n@test_generation\ndef save_and_run_comprehensive_repro():\n    code = r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\n\nfrom django.db import models, connection\n\ndef run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n    create_kwargs = create_kwargs or {}\n    new_instance_kwargs = new_instance_kwargs or {}\n    with connection.schema_editor() as schema_editor:\n        schema_editor.create_model(model_cls)\n    connection.queries_log.clear()\n    s0 = model_cls.objects.create(**create_kwargs)\n    connection.queries_log.clear()\n    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n    s1.save(raw=raw)\n    qs = connection.queries\n    sqls = [q['sql'].upper() for q in qs]\n    insert = any('INSERT INTO' in s for s in sqls)\n    update = any('UPDATE' in s for s in sqls)\n    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n    for obj in model_cls.objects.all():\n        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n\nclass MDefault(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app'\n\nclass MNoDefault(models.Model):\n    id = models.UUIDField(primary_key=True)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app2'\n\n# Scenario 1: default present, create without pk, then create new instance with same pk -> should UPDATE\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n\n# Scenario 1b: default present, raw=True save -> should also UPDATE\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n\n# Scenario 2: no default: create with explicit pk, then create new instance with same pk -> should UPDATE\npk = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n\n# Scenario 2b: no default, raw=True\npk2 = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\n'''\n    save_code_to_file('comprehensive_repro.py', code)\n    return exec_bash_cmd('python3 comprehensive_repro.py')",
+      "timestamp": 1767237735.4774997,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3Y0272Y1YjMRBJFu9K98Ev3TlXp",
+          "created": 1767237712,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Create comprehensive repro script that checks SQL executed (INSERT vs UPDATE) for explicit pk with/without default and raw save case.\n@test_generation\ndef save_and_run_comprehensive_repro():\n    code = r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\n\nfrom django.db import models, connection\n\ndef run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n    create_kwargs = create_kwargs or {}\n    new_instance_kwargs = new_instance_kwargs or {}\n    with connection.schema_editor() as schema_editor:\n        schema_editor.create_model(model_cls)\n    connection.queries_log.clear()\n    s0 = model_cls.objects.create(**create_kwargs)\n    connection.queries_log.clear()\n    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n    s1.save(raw=raw)\n    qs = connection.queries\n    sqls = [q['sql'].upper() for q in qs]\n    insert = any('INSERT INTO' in s for s in sqls)\n    update = any('UPDATE' in s for s in sqls)\n    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n    for obj in model_cls.objects.all():\n        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n\nclass MDefault(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app'\n\nclass MNoDefault(models.Model):\n    id = models.UUIDField(primary_key=True)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app2'\n\n# Scenario 1: default present, create without pk, then create new instance with same pk -> should UPDATE\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n\n# Scenario 1b: default present, raw=True save -> should also UPDATE\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n\n# Scenario 2: no default: create with explicit pk, then create new instance with same pk -> should UPDATE\npk = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n\n# Scenario 2b: no default, raw=True\npk2 = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\n'''\n    save_code_to_file('comprehensive_repro.py', code)\n    return exec_bash_cmd('python3 comprehensive_repro.py')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 2121,
+            "prompt_tokens": 10412,
+            "total_tokens": 12533,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 1472,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 7040,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n Traceback (most recent call last):\n  File \"comprehensive_repro.py\", line 47, in <module>\n    run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n  File \"comprehensive_repro.py\", line 25, in run_scenario\n    s1.save(raw=raw)\nTypeError: save() got an unexpected keyword argument 'raw'\n\n</output>",
+      "timestamp": 1767237735.952123
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Fix repro script to use save_base and avoid re-creating models; clear DB rows between scenarios and capture SQL queries.\n@bug_reproduction\ndef update_and_run_comprehensive_repro():\n    code = r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\n\nfrom django.db import models, connection\n\nclass MDefault(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app'\n\nclass MNoDefault(models.Model):\n    id = models.UUIDField(primary_key=True)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app2'\n\nfrom django.db import connection\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(MDefault)\n    schema_editor.create_model(MNoDefault)\n\ndef run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n    create_kwargs = create_kwargs or {}\n    new_instance_kwargs = new_instance_kwargs or {}\n    model_cls.objects.all().delete()\n    connection.queries.clear()\n    s0 = model_cls.objects.create(**create_kwargs)\n    model_cls.objects.all().delete()  # ensure only s0 influenced via pk, then clear so save_base will act on DB\n    connection.queries.clear()\n    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n    s1.save_base(raw=raw)\n    sqls = [q['sql'].upper() for q in connection.queries]\n    insert = any('INSERT INTO' in s for s in sqls)\n    update = any('UPDATE' in s for s in sqls)\n    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n    for obj in model_cls.objects.all():\n        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n\n# Scenario 1: default present, create without pk, then save instance with same pk -> should UPDATE, not INSERT\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n# Scenario 1b: default present, raw=True\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n\n# Scenario 2: no default: create with explicit pk, then save new instance with same pk -> should UPDATE\npk = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n# Scenario 2b: no default, raw=True\npk2 = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\n'''\n    save_code_to_file('comprehensive_repro_fixed.py', code)\n    return exec_bash_cmd('python3 comprehensive_repro_fixed.py')",
+      "timestamp": 1767237751.6705196,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3YNt15PjApGocN0pIKc6DTLAwgi",
+          "created": 1767237735,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Fix repro script to use save_base and avoid re-creating models; clear DB rows between scenarios and capture SQL queries.\n@bug_reproduction\ndef update_and_run_comprehensive_repro():\n    code = r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\n\nfrom django.db import models, connection\n\nclass MDefault(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app'\n\nclass MNoDefault(models.Model):\n    id = models.UUIDField(primary_key=True)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app2'\n\nfrom django.db import connection\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(MDefault)\n    schema_editor.create_model(MNoDefault)\n\ndef run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n    create_kwargs = create_kwargs or {}\n    new_instance_kwargs = new_instance_kwargs or {}\n    model_cls.objects.all().delete()\n    connection.queries.clear()\n    s0 = model_cls.objects.create(**create_kwargs)\n    model_cls.objects.all().delete()  # ensure only s0 influenced via pk, then clear so save_base will act on DB\n    connection.queries.clear()\n    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n    s1.save_base(raw=raw)\n    sqls = [q['sql'].upper() for q in connection.queries]\n    insert = any('INSERT INTO' in s for s in sqls)\n    update = any('UPDATE' in s for s in sqls)\n    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n    for obj in model_cls.objects.all():\n        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n\n# Scenario 1: default present, create without pk, then save instance with same pk -> should UPDATE, not INSERT\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n# Scenario 1b: default present, raw=True\nrun_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n\n# Scenario 2: no default: create with explicit pk, then save new instance with same pk -> should UPDATE\npk = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n# Scenario 2b: no default, raw=True\npk2 = uuid.uuid4()\nrun_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\n'''\n    save_code_to_file('comprehensive_repro_fixed.py', code)\n    return exec_bash_cmd('python3 comprehensive_repro_fixed.py')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1205,
+            "prompt_tokens": 11168,
+            "total_tokens": 12373,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 512,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 9088,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n MDefault raw= False INSERT= True UPDATE= True count= 1\n   row: 5c263d94-ebac-4606-919f-b697f1656aa2 Test 1\nMDefault raw= True INSERT= True UPDATE= True count= 1\n   row: 24ebd864-1506-4102-aa04-bb98b689135b Test raw\nMNoDefault raw= False INSERT= True UPDATE= True count= 1\n   row: deae0a74-3cdf-4eb6-9ea6-1694f5bcca0c Test 2\nMNoDefault raw= True INSERT= True UPDATE= True count= 1\n   row: 99c1399b-26e6-4c4a-824f-60d5e73ed3a4 Test raw2\n\n</output>",
+      "timestamp": 1767237752.1025398
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Verify patched behavior by running a focused repro that creates an object, then creates another with same explicit PK and calls save(), capturing SQL to ensure UPDATE (not a duplicate INSERT).\n@patch_verification\ndef run_focused_repro_and_check_sql():\n    save_code_to_file('verify_patch.py', r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\nfrom django.db import models, connection\n\nclass Sample(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app'\n\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(Sample)\n\nconnection.queries.clear()\ns0 = Sample.objects.create()\nconnection.queries.clear()\ns1 = Sample(pk=s0.pk, name='Test 1')\ns1.save()\nfor q in connection.queries:\n    print(q['sql'])\nprint(\"count:\", Sample.objects.count())\nfor obj in Sample.objects.all():\n    print(\"row:\", obj.pk, obj.name)\n''')\n    return exec_bash_cmd('python3 verify_patch.py')",
+      "timestamp": 1767237765.9319825,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3Ye17uBxvwope26m0DXut7IExMt",
+          "created": 1767237752,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Verify patched behavior by running a focused repro that creates an object, then creates another with same explicit PK and calls save(), capturing SQL to ensure UPDATE (not a duplicate INSERT).\n@patch_verification\ndef run_focused_repro_and_check_sql():\n    save_code_to_file('verify_patch.py', r'''\nimport uuid\nimport django\nfrom django.conf import settings\n\nsettings.configure(\n    DEBUG=True,\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n    INSTALLED_APPS=[],\n    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n)\ndjango.setup()\nfrom django.db import models, connection\n\nclass Sample(models.Model):\n    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n    name = models.CharField(blank=True, max_length=100)\n    class Meta:\n        app_label = 'tests_app'\n\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(Sample)\n\nconnection.queries.clear()\ns0 = Sample.objects.create()\nconnection.queries.clear()\ns1 = Sample(pk=s0.pk, name='Test 1')\ns1.save()\nfor q in connection.queries:\n    print(q['sql'])\nprint(\"count:\", Sample.objects.count())\nfor obj in Sample.objects.all():\n    print(\"row:\", obj.pk, obj.name)\n''')\n    return exec_bash_cmd('python3 verify_patch.py')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1132,
+            "prompt_tokens": 12068,
+            "total_tokens": 13200,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 832,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 11136,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n PRAGMA foreign_keys = OFF\nPRAGMA foreign_keys\nBEGIN\nCREATE TABLE \"tests_app_sample\" (\"id\" char(32) NOT NULL PRIMARY KEY, \"name\" varchar(100) NOT NULL)\nPRAGMA foreign_key_check\nPRAGMA foreign_keys = ON\nINSERT INTO \"tests_app_sample\" (\"id\", \"name\") SELECT 'd64fdb9518054e1da2e2e855c85f705d', ''\nUPDATE \"tests_app_sample\" SET \"name\" = 'Test 1' WHERE \"tests_app_sample\".\"id\" = 'd64fdb9518054e1da2e2e855c85f705d'\ncount: 1\nrow: d64fdb95-1805-4e1d-a2e2-e855c85f705d Test 1\n\n</output>",
+      "timestamp": 1767237766.3596933
+    },
+    {
+      "role": "assistant",
+      "content": "submit()",
+      "timestamp": 1767237771.2011704,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-Ct3Ys7nvoVvUPbYh6x8Dkab4aEKCC",
+          "created": 1767237766,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "submit()",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 396,
+            "prompt_tokens": 12563,
+            "total_tokens": 12959,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 384,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 12032,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "diff --git a/comprehensive_repro.py b/comprehensive_repro.py\nnew file mode 100644\nindex 0000000000..6b8952fbd1\n--- /dev/null\n+++ b/comprehensive_repro.py\n@@ -0,0 +1,58 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+\n+from django.db import models, connection\n+\n+def run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n+    create_kwargs = create_kwargs or {}\n+    new_instance_kwargs = new_instance_kwargs or {}\n+    with connection.schema_editor() as schema_editor:\n+        schema_editor.create_model(model_cls)\n+    connection.queries_log.clear()\n+    s0 = model_cls.objects.create(**create_kwargs)\n+    connection.queries_log.clear()\n+    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n+    s1.save(raw=raw)\n+    qs = connection.queries\n+    sqls = [q['sql'].upper() for q in qs]\n+    insert = any('INSERT INTO' in s for s in sqls)\n+    update = any('UPDATE' in s for s in sqls)\n+    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n+    for obj in model_cls.objects.all():\n+        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n+\n+class MDefault(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app'\n+\n+class MNoDefault(models.Model):\n+    id = models.UUIDField(primary_key=True)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app2'\n+\n+# Scenario 1: default present, create without pk, then create new instance with same pk -> should UPDATE\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n+\n+# Scenario 1b: default present, raw=True save -> should also UPDATE\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n+\n+# Scenario 2: no default: create with explicit pk, then create new instance with same pk -> should UPDATE\n+pk = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n+\n+# Scenario 2b: no default, raw=True\n+pk2 = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\ndiff --git a/comprehensive_repro_fixed.py b/comprehensive_repro_fixed.py\nnew file mode 100644\nindex 0000000000..d7579bbc96\n--- /dev/null\n+++ b/comprehensive_repro_fixed.py\n@@ -0,0 +1,60 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+\n+from django.db import models, connection\n+\n+class MDefault(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app'\n+\n+class MNoDefault(models.Model):\n+    id = models.UUIDField(primary_key=True)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app2'\n+\n+from django.db import connection\n+with connection.schema_editor() as schema_editor:\n+    schema_editor.create_model(MDefault)\n+    schema_editor.create_model(MNoDefault)\n+\n+def run_scenario(model_cls, create_kwargs=None, new_instance_kwargs=None, raw=False):\n+    create_kwargs = create_kwargs or {}\n+    new_instance_kwargs = new_instance_kwargs or {}\n+    model_cls.objects.all().delete()\n+    connection.queries.clear()\n+    s0 = model_cls.objects.create(**create_kwargs)\n+    model_cls.objects.all().delete()  # ensure only s0 influenced via pk, then clear so save_base will act on DB\n+    connection.queries.clear()\n+    s1 = model_cls(pk=s0.pk, **new_instance_kwargs)\n+    s1.save_base(raw=raw)\n+    sqls = [q['sql'].upper() for q in connection.queries]\n+    insert = any('INSERT INTO' in s for s in sqls)\n+    update = any('UPDATE' in s for s in sqls)\n+    print(model_cls.__name__, \"raw=\", raw, \"INSERT=\", insert, \"UPDATE=\", update, \"count=\", model_cls.objects.count())\n+    for obj in model_cls.objects.all():\n+        print(\"   row:\", obj.pk, getattr(obj, 'name', None))\n+\n+# Scenario 1: default present, create without pk, then save instance with same pk -> should UPDATE, not INSERT\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test 1'}, raw=False)\n+# Scenario 1b: default present, raw=True\n+run_scenario(MDefault, create_kwargs={}, new_instance_kwargs={'name':'Test raw'}, raw=True)\n+\n+# Scenario 2: no default: create with explicit pk, then save new instance with same pk -> should UPDATE\n+pk = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk}, new_instance_kwargs={'name':'Test 2'}, raw=False)\n+# Scenario 2b: no default, raw=True\n+pk2 = uuid.uuid4()\n+run_scenario(MNoDefault, create_kwargs={'id': pk2}, new_instance_kwargs={'name':'Test raw2'}, raw=True)\ndiff --git a/django/db/models/base.py b/django/db/models/base.py\nindex e3b14a41a0..f9c2f51790 100644\n--- a/django/db/models/base.py\n+++ b/django/db/models/base.py\n@@ -850,7 +850,7 @@ class Model(metaclass=ModelBase):\n         # Skip an UPDATE when adding an instance and primary key has a default.\n         if (\n             not force_insert and\n-            self._state.adding and\n+            self._state.adding and not pk_set and\n             self._meta.pk.default and\n             self._meta.pk.default is not NOT_PROVIDED\n         ):\n@@ -1099,7 +1099,7 @@ class Model(metaclass=ModelBase):\n             # allows single model to have effectively multiple primary keys.\n             # Refs #17615.\n             model_class_pk = self._get_pk_val(model_class._meta)\n-            if not self._state.adding and model_class_pk is not None:\n+            if not self._state.adding and not pk_set and model_class_pk is not None:\n                 qs = qs.exclude(pk=model_class_pk)\n             if qs.exists():\n                 if len(unique_check) == 1:\n@@ -1130,7 +1130,7 @@ class Model(metaclass=ModelBase):\n             qs = model_class._default_manager.filter(**lookup_kwargs)\n             # Exclude the current object from the query if we are editing an\n             # instance (as opposed to creating a new one)\n-            if not self._state.adding and self.pk is not None:\n+            if not self._state.adding and not pk_set and self.pk is not None:\n                 qs = qs.exclude(pk=self.pk)\n \n             if qs.exists():\ndiff --git a/repro_save_pk.py b/repro_save_pk.py\nnew file mode 100644\nindex 0000000000..ba9126e40c\n--- /dev/null\n+++ b/repro_save_pk.py\n@@ -0,0 +1,33 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+\n+from django.db import models, connection\n+\n+class Sample(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+\n+    class Meta:\n+        app_label = \"tests_app\"\n+\n+with connection.schema_editor() as schema_editor:\n+    schema_editor.create_model(Sample)\n+\n+s0 = Sample.objects.create()\n+print(\"s0:\", s0.pk)\n+s1 = Sample(pk=s0.pk, name=\"Test 1\")\n+s1.save()\n+print(\"s1 after save pk:\", s1.pk)\n+print(\"count:\", Sample.objects.count())\n+for obj in Sample.objects.all():\n+    print(\"row:\", obj.pk, obj.name)\ndiff --git a/verify_patch.py b/verify_patch.py\nnew file mode 100644\nindex 0000000000..5ebdd35591\n--- /dev/null\n+++ b/verify_patch.py\n@@ -0,0 +1,33 @@\n+\n+import uuid\n+import django\n+from django.conf import settings\n+\n+settings.configure(\n+    DEBUG=True,\n+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+    INSTALLED_APPS=[],\n+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',\n+)\n+django.setup()\n+from django.db import models, connection\n+\n+class Sample(models.Model):\n+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)\n+    name = models.CharField(blank=True, max_length=100)\n+    class Meta:\n+        app_label = 'tests_app'\n+\n+with connection.schema_editor() as schema_editor:\n+    schema_editor.create_model(Sample)\n+\n+connection.queries.clear()\n+s0 = Sample.objects.create()\n+connection.queries.clear()\n+s1 = Sample(pk=s0.pk, name='Test 1')\n+s1.save()\n+for q in connection.queries:\n+    print(q['sql'])\n+print(\"count:\", Sample.objects.count())\n+for obj in Sample.objects.all():\n+    print(\"row:\", obj.pk, obj.name)\n\n",
+      "timestamp": 1767237772.2531326
+    }
+  ],
+  "trajectory_format": "mini-swe-agent-1",
+  "instance_id": "django__django-12209"
+}

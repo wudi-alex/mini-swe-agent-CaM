@@ -128,7 +128,7 @@ def print_definition(name_file_list, show_comments=False):
             for node in definitions:
                 print(f"{file_path} {name}:")
                 _print_code_with_lines(lines, node, show_comments)
-                print()
+                print('======')
 
         except Exception as e:
             print(f"{file_path} {name}: error reading file - {e}\n")
