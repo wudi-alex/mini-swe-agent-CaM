@@ -5,9 +5,11 @@ import json
 import re
 import tempfile
 import sys
+import io
 
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-# ===== Compatibility Helper Functions =====
 def get_node_end_lineno(node, source_lines):
     """
     Get the end line number of an AST node (compatible with Python 3.6/3.7)
@@ -321,192 +323,302 @@ def find_code_block_lines(file_content, old_code):
     return None, None
 
 
-def code_replace(file_path, old_code, new_code):
+import os
+import re
+import tempfile
+import subprocess
+
+
+def code_replace(file_path, new_code, line_numbers, use_lint=False):
     """
-    Replace code in Python file and perform lint check
-    Ignores comments when matching old code
-    Replaces by line range (including comment lines)
+    Replace code by line range with auto indent adjustment
 
     Args:
         file_path: Path to Python file
-        old_code: Code to be replaced (comments are ignored during matching)
-        new_code: New code
+        new_code: New code to replace with
+        line_numbers: Tuple (start_line, end_line), 1-based indexing
+        use_lint: Whether to run syntax and pyflakes check (default: False)
 
     Returns:
         bool: Whether replacement was successful
     """
     if not os.path.exists(file_path):
-        print("Error: File '{}' does not exist".format(file_path))
-        return False
-
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            original_content = f.read()
-    except Exception as e:
-        print("Error: Cannot read file {}".format(e))
-        return False
-
-    start_line, end_line = find_code_block_lines(original_content, old_code)
-
-    if start_line is None:
-        print("Error: Code to replace not found in file")
-        print("Looking for:\n{}".format(old_code))
-        return False
-
-    file_lines = original_content.split('\n')
-    new_code_normalized = normalize(new_code)
-    new_code_lines = new_code_normalized.split('\n')
-
-    new_file_lines = (
-            file_lines[:start_line] +
-            new_code_lines +
-            file_lines[end_line + 1:]
-    )
-
-    new_content = '\n'.join(new_file_lines)
-
-    tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
-    tmp_file.write(new_content)
-    tmp_file.close()
-    tmp_path = tmp_file.name
-
-    try:
-        result = subprocess.run(
-            ['python', '-m', 'py_compile', tmp_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            timeout=10,
-            errors='replace',
-        )
-
-        if result.returncode != 0:
-            print("Error: Syntax error in replaced code")
-            print(result.stderr)
-            return False
-
-        try:
-            flake_result = subprocess.run(
-                ['pyflakes', tmp_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                timeout=10,
-                errors='replace',
-            )
-            if flake_result.stdout:
-                print("Warning: Lint check found issues")
-                print(flake_result.stdout)
-        except FileNotFoundError:
-            pass
-
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-
-        print("Replaced.")
-        return True
-
-    except subprocess.TimeoutExpired:
-        print("Error: Lint check timeout")
-        return False
-    except Exception as e:
-        print("Error: {}".format(e))
-        return False
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-def code_insert(file_path, new_code, line_number):
-    """
-    Insert code at specified line number in Python file and perform lint check
-
-    Args:
-        file_path: Path to Python file
-        new_code: Code to insert
-        line_number: Line number to insert at (1-based indexing)
-
-    Returns:
-        bool: Whether insertion was successful
-    """
-    if not os.path.exists(file_path):
-        print("Error: File '{}' does not exist".format(file_path))
+        print(f"Error: File '{file_path}' does not exist")
         return False
 
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except Exception as e:
-        print("Error: Cannot read file - {}".format(e))
+        print(f"Error: Cannot read file - {e}")
+        return False
+
+    start_line, end_line = line_numbers
+
+    if start_line < 1 or end_line < 1:
+        print("Error: Line numbers must be >= 1")
+        return False
+    if start_line > end_line:
+        print("Error: start_line must be <= end_line")
+        return False
+    if end_line > len(lines):
+        print(f"Error: end_line {end_line} exceeds file length ({len(lines)})")
+        return False
+
+    old_lines = lines[start_line - 1:end_line]
+    old_code_str = ''.join(old_lines)
+
+    new_code_lines = new_code.split('\n')
+    new_code_lines = [line + '\n' for line in new_code_lines]
+
+    target_indent = _detect_indent(old_lines[0]) if old_lines else ""
+
+    result = _try_replace_with_indent(file_path, lines, start_line, end_line,
+                                       new_code_lines, target_indent, use_lint)
+
+    if result:
+        _print_line_mapping(start_line, end_line, len(new_code_lines), old_code_str, new_code)
+        return True
+    return False
+
+
+def code_insert(file_path, new_code, line_number, use_lint=False):
+    """
+    Insert code at specified line with auto indent adjustment
+
+    Args:
+        file_path: Path to Python file
+        new_code: Code to insert
+        line_number: Line number to insert at (1-based)
+        use_lint: Whether to run syntax and pyflakes check (default: False)
+
+    Returns:
+        bool: Whether insertion was successful
+    """
+    if not os.path.exists(file_path):
+        print(f"Error: File '{file_path}' does not exist")
+        return False
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"Error: Cannot read file - {e}")
         return False
 
     if line_number < 1:
         print("Error: Line number must be >= 1")
         return False
-
     if line_number > len(lines) + 1:
-        print("Error: Line number {} exceeds file length (max: {})".format(
-            line_number, len(lines) + 1))
+        print(f"Error: Line number {line_number} exceeds max ({len(lines) + 1})")
         return False
 
-    if not new_code.endswith('\n'):
-        new_code = new_code + '\n'
+    if line_number <= len(lines):
+        target_indent = _detect_indent(lines[line_number - 1])
+    elif lines:
+        target_indent = _detect_indent(lines[-1])
+    else:
+        target_indent = ""
 
-    insert_index = line_number - 1
-    lines.insert(insert_index, new_code)
+    new_code_lines = [line + '\n' for line in new_code.split('\n')]
 
-    new_content = ''.join(lines)
+    result = _try_insert_with_indent(file_path, lines, line_number, new_code_lines, target_indent, use_lint)
 
-    tmp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
-    tmp_file.write(new_content)
-    tmp_file.close()
-    tmp_path = tmp_file.name
+    if result:
+        print(f"Inserted {len(new_code_lines)} lines at L{line_number}")
+        print(f"  Code: {_preview(new_code)}")
+        return True
+    return False
+
+
+# ============ Internal Helper Functions ============
+
+def _detect_indent(line):
+    """Detect leading whitespace"""
+    match = re.match(r'^(\s*)', line)
+    return match.group(1) if match else ""
+
+
+def _adjust_indent(code_lines, target_indent):
+    """Adjust code lines to target indentation"""
+    if not code_lines:
+        return code_lines
+
+    min_indent = None
+    for line in code_lines:
+        stripped = line.rstrip('\n')
+        if stripped.strip():
+            current = _detect_indent(stripped)
+            if min_indent is None or len(current) < len(min_indent):
+                min_indent = current
+
+    min_indent = min_indent or ""
+
+    adjusted = []
+    for line in code_lines:
+        stripped = line.rstrip('\n')
+        if stripped.strip():
+            if stripped.startswith(min_indent):
+                new_line = target_indent + stripped[len(min_indent):]
+            else:
+                new_line = target_indent + stripped.lstrip()
+            adjusted.append(new_line + '\n')
+        else:
+            adjusted.append('\n')
+
+    return adjusted
+
+
+def _try_replace_with_indent(file_path, lines, start_line, end_line, new_code_lines, target_indent, use_lint):
+    """Try replacement with auto indent adjustment"""
+    # If lint is off, just adjust indent and write directly
+    if not use_lint:
+        adjusted = _adjust_indent(new_code_lines, target_indent)
+        new_lines = lines[:start_line - 1] + adjusted + lines[end_line:]
+        new_content = ''.join(new_lines)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        return True
+
+    # If lint is on, try with syntax check
+    result = _do_replace(file_path, lines, start_line, end_line, new_code_lines)
+    if result is True:
+        return True
+
+    if result == 'indent_error':
+        print("Attempting indent adjustment...")
+        adjusted = _adjust_indent(new_code_lines, target_indent)
+        result = _do_replace(file_path, lines, start_line, end_line, adjusted)
+        if result is True:
+            print("Fixed with indent adjustment")
+            return True
+
+    if result == 'indent_error':
+        for spaces in [0, 4, 8, 12]:
+            adjusted = _adjust_indent(new_code_lines, ' ' * spaces)
+            result = _do_replace(file_path, lines, start_line, end_line, adjusted)
+            if result is True:
+                print(f"Fixed with {spaces}-space indent")
+                return True
+
+    return False
+
+
+def _try_insert_with_indent(file_path, lines, line_number, new_code_lines, target_indent, use_lint):
+    """Try insertion with auto indent adjustment"""
+    # If lint is off, just adjust indent and write directly
+    if not use_lint:
+        adjusted = _adjust_indent(new_code_lines, target_indent)
+        idx = line_number - 1
+        new_lines = lines[:idx] + adjusted + lines[idx:]
+        new_content = ''.join(new_lines)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        return True
+
+    # If lint is on, try with syntax check
+    result = _do_insert(file_path, lines, line_number, new_code_lines)
+    if result is True:
+        return True
+
+    if result == 'indent_error':
+        print("Attempting indent adjustment...")
+        adjusted = _adjust_indent(new_code_lines, target_indent)
+        result = _do_insert(file_path, lines, line_number, adjusted)
+        if result is True:
+            print("Fixed with indent adjustment")
+            return True
+
+    return False
+
+
+def _do_replace(file_path, lines, start_line, end_line, new_code_lines):
+    """Execute replacement with syntax check. Returns: True, 'indent_error', 'syntax_error', or False"""
+    new_lines = lines[:start_line - 1] + new_code_lines + lines[end_line:]
+    return _validate_and_write(file_path, new_lines)
+
+
+def _do_insert(file_path, lines, line_number, new_code_lines):
+    """Execute insertion with syntax check"""
+    idx = line_number - 1
+    new_lines = lines[:idx] + new_code_lines + lines[idx:]
+    return _validate_and_write(file_path, new_lines)
+
+
+def _validate_and_write(file_path, new_lines):
+    """Validate syntax and write if OK (only called when use_lint=True)"""
+    new_content = ''.join(new_lines)
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
+    tmp.write(new_content)
+    tmp.close()
+    tmp_path = tmp.name
 
     try:
+        # Syntax check
         result = subprocess.run(
             ['python', '-m', 'py_compile', tmp_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            timeout=10,
-            errors='replace',
+            capture_output=True, text=True, timeout=10
         )
 
         if result.returncode != 0:
-            print("Error: Syntax error after code insertion")
-            print(result.stderr)
-            return False
+            err = result.stderr or result.stdout
+            if 'indent' in err.lower():
+                return 'indent_error'
+            _print_syntax_error(err)
+            return 'syntax_error'
 
+        # Pyflakes lint check
         try:
-            flake_result = subprocess.run(
-                ['pyflakes', tmp_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                errors='replace',
-                timeout=10
-            )
-            if flake_result.stdout:
-                print("Warning: Lint check found issues")
-                print(flake_result.stdout)
+            flake = subprocess.run(['pyflakes', tmp_path], capture_output=True, text=True, timeout=10)
+            if flake.stdout:
+                print("Lint warnings:")
+                for line in flake.stdout.strip().split('\n')[:5]:
+                    print(f"  {line.split(':')[-1].strip()}")
         except FileNotFoundError:
             pass
 
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
-
-        print("Inserted.")
         return True
 
     except subprocess.TimeoutExpired:
-        print("Error: Lint check timeout")
+        print("Error: Syntax check timeout")
         return False
     except Exception as e:
-        print("Error: {}".format(e))
+        print(f"Error: {e}")
         return False
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _print_syntax_error(error_msg):
+    """Print concise syntax error"""
+    for line in error_msg.strip().split('\n'):
+        match = re.search(r'(SyntaxError|IndentationError):\s*(.+)', line)
+        if match:
+            print(f"Syntax Error: {match.group(2)}")
+            return
+    for line in reversed(error_msg.strip().split('\n')):
+        if line.strip():
+            print(f"Error: {line.strip()}")
+            return
+
+
+def _print_line_mapping(start_line, end_line, new_count, old_code, new_code):
+    """Print concise line mapping"""
+    old_count = end_line - start_line + 1
+    new_end = start_line + new_count - 1
+    print(f"Replaced L{start_line}-{end_line} ({old_count} lines) -> L{start_line}-{new_end} ({new_count} lines)")
+    print(f"  Old: {_preview(old_code)}")
+    print(f"  New: {_preview(new_code)}")
+
+
+def _preview(code):
+    """Generate code preview without special characters"""
+    preview = code.strip().replace('\n', '\n')
+    return preview
 
 
 def print_code_context(file_path, lines, show_comments=False):

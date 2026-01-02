@@ -48,6 +48,16 @@ class DockerEnvironmentCam:
         self.logger = logger or logging.getLogger("minisweagent.environment")
         self.container_id: str | None = None
         self.config = config_class(**kwargs)
+
+        # Set UTF-8 encoding environment variables to avoid ASCII errors
+        utf8_env = {
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONIOENCODING": "utf-8",
+        }
+        # Merge with existing env, user-provided env takes precedence
+        self.config.env = {**utf8_env, **self.config.env}
+
         self._start_container()
 
         # Setup pytest after container starts
@@ -67,12 +77,22 @@ class DockerEnvironmentCam:
             container_name,
             "-w",
             self.config.cwd,
+        ]
+
+        # Add environment variables for UTF-8 encoding
+        for key, value in self.config.env.items():
+            cmd.extend(["-e", f"{key}={value}"])
+
+        cmd.extend([
             *self.config.run_args,
             self.config.image,
             "sleep",
             self.config.container_timeout,
-        ]
+        ])
+
         self.logger.debug(f"Starting container with command: {shlex.join(cmd)}")
+        self.logger.info(f"Container encoding set to UTF-8 (LANG=C.UTF-8, LC_ALL=C.UTF-8, PYTHONIOENCODING=utf-8)")
+
         result = subprocess.run(
             cmd,
             capture_output=True,
