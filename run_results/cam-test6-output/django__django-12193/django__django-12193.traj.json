@@ -1,0 +1,461 @@
+{
+  "info": {
+    "exit_status": "Submitted",
+    "submission": "diff --git a/django/contrib/postgres/forms/array.py b/django/contrib/postgres/forms/array.py\nindex 2e19cd574a..2de04c9d89 100644\n--- a/django/contrib/postgres/forms/array.py\n+++ b/django/contrib/postgres/forms/array.py\n@@ -145,9 +145,11 @@ class SplitArrayWidget(forms.Widget):\n             except IndexError:\n                 widget_value = None\n             if id_:\n-                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n+                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n+            else:\n+                attrs_i = dict(final_attrs)\n             context['widget']['subwidgets'].append(\n-                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']\n+                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\n             )\n         return context\n \ndiff --git a/isolated_repro.py b/isolated_repro.py\nnew file mode 100644\nindex 0000000000..b0bab3532a\n--- /dev/null\n+++ b/isolated_repro.py\n@@ -0,0 +1,65 @@\n+\n+# Minimal local repro of SplitArrayWidget.get_context behavior without importing django package\n+class FakeWidgetBase:\n+    def __init__(self, *args, **kwargs):\n+        self.is_hidden = False\n+        self.is_localized = False\n+        self.media = None\n+    def get_context(self, name, value, attrs=None):\n+        return {'widget': {'name': name, 'value': value, 'attrs': attrs or {}}}\n+    def build_attrs(self, base_attrs, extra_attrs=None):\n+        a = dict(base_attrs or {})\n+        if extra_attrs:\n+            a.update(extra_attrs)\n+        return a\n+\n+class MutatingCheckbox:\n+    def __init__(self):\n+        pass\n+    def get_context(self, name, value, attrs=None):\n+        if attrs is None:\n+            attrs = {}\n+        # BUGGY widget: mutates the attrs dict by setting 'checked' when value is truthy\n+        if value:\n+            attrs['checked'] = True\n+        elif 'checked' in attrs:\n+            # simulate widget leaving checked if not careful (it only sets when True)\n+            pass\n+        return {'widget': {'name': name, 'value': value, 'attrs': attrs}}\n+\n+class SplitArrayWidget:\n+    def __init__(self, widget, size, **kwargs):\n+        self.widget = widget() if isinstance(widget, type) else widget\n+        self.size = size\n+        self.is_localized = False\n+    @property\n+    def is_hidden(self):\n+        return self.widget.is_hidden\n+    def build_attrs(self, attrs):\n+        return dict(attrs or {})\n+    def get_context(self, name, value, attrs=None):\n+        attrs = {} if attrs is None else attrs\n+        # simulate super().get_context returning a dict with 'widget'\n+        context = {'widget': {}}\n+        value = value or []\n+        context['widget']['subwidgets'] = []\n+        final_attrs = self.build_attrs(attrs)\n+        id_ = final_attrs.get('id')\n+        for i in range(max(len(value), self.size)):\n+            try:\n+                widget_value = value[i]\n+            except IndexError:\n+                widget_value = None\n+            if id_:\n+                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n+            else:\n+                attrs_i = dict(final_attrs)\n+            context['widget']['subwidgets'].append(\n+                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\n+            )\n+        return context\n+\n+w = SplitArrayWidget(widget=MutatingCheckbox, size=4)\n+ctx = w.get_context('field', [True, False, False, True], {'id':'id_field'})\n+for i, sub in enumerate(ctx['widget']['subwidgets']):\n+    print(f\"index={i}, value={sub['value']}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\ndiff --git a/repro_splitarray_checkbox.py b/repro_splitarray_checkbox.py\nnew file mode 100644\nindex 0000000000..3fade56d79\n--- /dev/null\n+++ b/repro_splitarray_checkbox.py\n@@ -0,0 +1,9 @@\n+\n+from django import forms\n+from django.contrib.postgres.forms.array import SplitArrayWidget\n+import pprint\n+\n+w = SplitArrayWidget(widget=forms.CheckboxInput, size=4)\n+ctx = w.get_context('field', [True, False, False, True], {'id': 'id_field'})\n+for i, sub in enumerate(ctx['widget']['subwidgets']):\n+    print(f\"index={i}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\n\n",
+    "model_stats": {
+      "instance_cost": 0.014865900000000001,
+      "api_calls": 7
+    },
+    "mini_version": "1.17.3",
+    "config": {
+      "agent": {
+        "system_template": "You are an ultra token & round-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage and interactive turns. Each of your output is executable python code formated as follows.\n\n<format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence of reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nCRITICAL STRATEGY: \"Search First, Navigate Later\"\n\nYou must immediately hypothesize the location of the bug based on the Issue Description and use `grep` to pinpoint the exact file and line number when the bug location can be inferred from issue. If you need to understand the structure of codebase first, use 'ls -la'.\n\n## Localization Workflow\n1. **Analyze:** Read the issue to extract key terms (Function names, Class names, Error messages, or unique logic keywords).\n2. **Hypothesize:** If no specific name is given, guess the likely function name (e.g., if the issue is about \"login failure\", guess `login`, `auth`, or `authenticate`).\n3. **Search:** Use `grep -RIn` (or `grep -RInE` for regex) to find definitions or references. **Crucial:** Narrow down your search by specifying file extensions (e.g., `*.py`) and specific directories (e.g., `src/utils`) whenever the context allows.\n4. **Verify:** Only read the specific file content once you have a grep hit.\n\n## Command Best Practices\n- **Standard Search:** `grep -RIn \"Pattern\" .` (Always include line numbers `-n` and ignore binary `-I`).\n- **Filter by File Extension (Highly Recommended):** Use `--include` to avoid noise and save tokens.\n  - Python only: `grep -RIn --include=\"*.py\" \"Pattern\" .`\n  - Java only: `grep -RIn --include=\"*.java\" \"Pattern\" .`\n  - C/C++: `grep -RIn --include=\"*.{c,h,cpp}\" \"Pattern\" .`\n- **Target Specific Directory:** If the issue clearly points to a module (e.g., \"frontend\", \"utils\"), replace `.` with the specific path.\n  - Example: `grep -RIn \"Pattern\" src/utils`\n- **Complex Patterns:** `grep -RInE \"PatternA|PatternB\" .`\n- **Definitions:**\n  - Function: `grep -RIn \"^def function_name\" .`\n  - Class: `grep -RIn \"^class ClassName\" .`\n  - Function Call: `grep -RIn \"^function_name(\" .`\n\n## Examples of Strategic Searching\n\n### Scenario 1: The issue explicitly names a function in a known language (e.g., \"Integer overflow in `calculate_budget` in the Python backend\")\n**Thought:** IFilter for `.py` files to avoid matching compiled files or logs.\n**Command:** `grep -RIn --include=\"*.py\" \"def calculate_budget\" .`\n\n### Scenario 2: The issue implies a specific module location (e.g., \"The `DateUtils` helper in the utility folder is parsing dates wrong\")\n**Thought:** The issue points to `utils` or a similar folder. Restrict the search to that directory to speed up the process and reduce noise.\n**Command:** `grep -RIn \"class DateUtils\" src/utils`\n\n### Scenario 3: Investigating a symptom in a specific component (e.g., \"Login page raises an error on button click\")\n**Thought:** This is likely a frontend issue or a views issue. Search for \"login\" logic specifically in the `views` or `frontend` directory, and I am looking for Python files.\n**Command:** `grep -RIn --include=\"*.py\" -i \"login\" src/views`\n\n### Scenario 4: Broad search for keywords with file restrictions (e.g., \"JSON serialization fails during export\")\n**Thought:** No function name is given, but \"JSON\" and \"export\" are key. Look for functions that combine these concepts, restricting to `.py` files to filter out noise.\n**Command:** `grep -RInE --include=\"*.py\" \"json.*dump|export|serialize\" .`\n\n### Scenario 5: Tracing a call site in a test file (e.g., \"The test `test_process_payment` is failing\")\n**Thought:** Find the test definition. It is likely in a `tests` directory.\n**Command:** `grep -RIn \"def test_process_payment\" tests/`\n\n---\n**ACTION REQUIRED:**\nBased on the current issue description, generate your hypothesis, construct a precise `grep` command (using `--include` and specific paths if possible), and execute it immediately.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)];\n2. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path;\n3. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code or patch code replacement;\n4. save_code_to_file(file_path: str, code: str,): tool used to save code to file_path, for example, creating testing scripts;\n5. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\n## Other Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.\n",
+        "instance_template": "<pr_description>\nConsider the following PR description:\n{{task}}\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>\n",
+        "timeout_template": "The last action timed out and has been killed.\nThe output of the action was:\n{% if output | length < 10000 -%}\n<output>\n{{output}}\n</output>\n{%- else -%}\n<warning>Output was too long and has been truncated.</warning>\n<output_head>\n{{ output[:5000] }}\n</output_head>\n<elided_chars>{{ output | length - 10000 }} characters elided</elided_chars>\n<output_tail>\n{{ output[-5000:] }}\n</output_tail>\n{%- endif %}\nPlease try another command and make sure to avoid those requiring interactive input.\n",
+        "format_error_template": "Please always provide EXACTLY ONE action in triple backticks, found actions.\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).\n",
+        "action_observation_template": "<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n",
+        "action_regex": "```bash\\s*\\n(.*?)\\n```",
+        "step_limit": 50,
+        "cost_limit": 1.0
+      },
+      "model": {
+        "model_name": "openai/gpt-5-mini",
+        "model_kwargs": {},
+        "litellm_model_registry": null,
+        "set_cache_control": null,
+        "cost_tracking": "default"
+      },
+      "environment": {
+        "image": "docker.io/swebench/sweb.eval.x86_64.django_1776_django-12193:latest",
+        "cwd": "/testbed",
+        "env": {
+          "LANG": "C.UTF-8",
+          "LC_ALL": "C.UTF-8",
+          "PYTHONIOENCODING": "utf-8",
+          "PAGER": "cat",
+          "MANPAGER": "cat",
+          "LESS": "-R",
+          "PIP_PROGRESS_BAR": "off",
+          "TQDM_DISABLE": "1"
+        },
+        "forward_env": [],
+        "timeout": 60,
+        "executable": "docker",
+        "run_args": [
+          "--rm"
+        ],
+        "container_timeout": "2h",
+        "pull_timeout": 120
+      },
+      "agent_type": "minisweagent.run.extra.swebench_cam.ProgressTrackingAgent",
+      "model_type": "minisweagent.models.litellm_model.LitellmModel",
+      "environment_type": "minisweagent.environments.docker_cam.DockerEnvironmentCam"
+    }
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an ultra token & round-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usage and interactive turns. Each of your output is executable python code formated as follows.\n\n<format_example>\n# Thoughts: <Reasoning>\n@<stage>\ndef <action>_to_<intent>():\n    <tool_function_calls>\n    return <result>\n</format_example>\n\nFormat Description:\n0. Comments as thinking process start with 'Thoughts'. Keep using concise one or two sentence of reasoning, never use no-information words like 'I need to / I will'.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is tool execution sequence (with no comments inside). Try to compress tool call sequence into one turn to fulfill one action (for example, first save test code then execute it). All tool functions are provided by the next section.\n4. Result should be the necessary input for next turn's action.\n\nCRITICAL STRATEGY: \"Search First, Navigate Later\"\n\nYou must immediately hypothesize the location of the bug based on the Issue Description and use `grep` to pinpoint the exact file and line number when the bug location can be inferred from issue. If you need to understand the structure of codebase first, use 'ls -la'.\n\n## Localization Workflow\n1. **Analyze:** Read the issue to extract key terms (Function names, Class names, Error messages, or unique logic keywords).\n2. **Hypothesize:** If no specific name is given, guess the likely function name (e.g., if the issue is about \"login failure\", guess `login`, `auth`, or `authenticate`).\n3. **Search:** Use `grep -RIn` (or `grep -RInE` for regex) to find definitions or references. **Crucial:** Narrow down your search by specifying file extensions (e.g., `*.py`) and specific directories (e.g., `src/utils`) whenever the context allows.\n4. **Verify:** Only read the specific file content once you have a grep hit.\n\n## Command Best Practices\n- **Standard Search:** `grep -RIn \"Pattern\" .` (Always include line numbers `-n` and ignore binary `-I`).\n- **Filter by File Extension (Highly Recommended):** Use `--include` to avoid noise and save tokens.\n  - Python only: `grep -RIn --include=\"*.py\" \"Pattern\" .`\n  - Java only: `grep -RIn --include=\"*.java\" \"Pattern\" .`\n  - C/C++: `grep -RIn --include=\"*.{c,h,cpp}\" \"Pattern\" .`\n- **Target Specific Directory:** If the issue clearly points to a module (e.g., \"frontend\", \"utils\"), replace `.` with the specific path.\n  - Example: `grep -RIn \"Pattern\" src/utils`\n- **Complex Patterns:** `grep -RInE \"PatternA|PatternB\" .`\n- **Definitions:**\n  - Function: `grep -RIn \"^def function_name\" .`\n  - Class: `grep -RIn \"^class ClassName\" .`\n  - Function Call: `grep -RIn \"^function_name(\" .`\n\n## Examples of Strategic Searching\n\n### Scenario 1: The issue explicitly names a function in a known language (e.g., \"Integer overflow in `calculate_budget` in the Python backend\")\n**Thought:** IFilter for `.py` files to avoid matching compiled files or logs.\n**Command:** `grep -RIn --include=\"*.py\" \"def calculate_budget\" .`\n\n### Scenario 2: The issue implies a specific module location (e.g., \"The `DateUtils` helper in the utility folder is parsing dates wrong\")\n**Thought:** The issue points to `utils` or a similar folder. Restrict the search to that directory to speed up the process and reduce noise.\n**Command:** `grep -RIn \"class DateUtils\" src/utils`\n\n### Scenario 3: Investigating a symptom in a specific component (e.g., \"Login page raises an error on button click\")\n**Thought:** This is likely a frontend issue or a views issue. Search for \"login\" logic specifically in the `views` or `frontend` directory, and I am looking for Python files.\n**Command:** `grep -RIn --include=\"*.py\" -i \"login\" src/views`\n\n### Scenario 4: Broad search for keywords with file restrictions (e.g., \"JSON serialization fails during export\")\n**Thought:** No function name is given, but \"JSON\" and \"export\" are key. Look for functions that combine these concepts, restricting to `.py` files to filter out noise.\n**Command:** `grep -RInE --include=\"*.py\" \"json.*dump|export|serialize\" .`\n\n### Scenario 5: Tracing a call site in a test file (e.g., \"The test `test_process_payment` is failing\")\n**Thought:** Find the test definition. It is likely in a `tests` directory.\n**Command:** `grep -RIn \"def test_process_payment\" tests/`\n\n---\n**ACTION REQUIRED:**\nBased on the current issue description, generate your hypothesis, construct a precise `grep` command (using `--include` and specific paths if possible), and execute it immediately.\n\nTools:\nNotice! ALL PRINT TOOL HAS NO RETURN RESULT AND JUST FOR PRINTING, WHILE CODE PRINTING HAS NO COMMENTS! IF YOU WANT TO SEE CODE WITH COMMENTS, USE BASH CMD TOOL.\n1. print_definition(name_file_list:List[Tuple]): tool used to print the definition code of (name, file_path)s. For example, [(print_main, main.py)];\n2. print_code_context(file_path: str, lines:Tuple): tool used to display specific code line block within (start_line_number, end_line_number) from file_path;\n3. exec_bash_cmd(cmd: str): tool used to execute a shell command cmd when specific Python tools are insufficient, such as complex grep commands or execute python code or patch code replacement;\n4. save_code_to_file(file_path: str, code: str,): tool used to save code to file_path, for example, creating testing scripts;\n5. submit(): a special tool used to end task and submit task. NOTICE! ALWAYS USE THIS FUNCTION ALONE AS MESSAGE TO FINISH TASK! NO OTHER WORDS IN MESSAGE!\n\n## Other Useful Command Examples When Using CMD TOOL\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\nReminds:\n1. The function defined in the message will be automatically executed. NOTICE! NO NEED TO INCLUDE THE MAIN ENTREE!\n2. You can directly write the experimental code during debug stage without using the tools. NOTICE! ONLY USE THE PYTHON STANDARD PACKAGE AND INTERNAL PROJECT MODULE WITHOUT EXTERNAL PACKAGE USING SUCH AS NUMPY!\n\nFailure to follow these rules will cause your response to be rejected.",
+      "timestamp": 1767573751.0288107
+    },
+    {
+      "role": "user",
+      "content": "<pr_description>\nConsider the following PR description:\nSplitArrayField with BooleanField always has widgets checked after the first True value.\nDescription\n\t \n\t\t(last modified by Peter Andersen)\n\t \nWhen providing a SplitArrayField BooleanField with preexisting data, the final_attrs dict is updated to include 'checked': True after the for loop has reached the first True value in the initial data array. Once this occurs every widget initialized after that defaults to checked even though the backing data may be False. This is caused by the CheckboxInput widget's get_context() modifying the attrs dict passed into it. This is the only widget that modifies the attrs dict passed into its get_context().\nCheckboxInput setting attrs['checked'] to True: \u200bhttps://github.com/django/django/blob/master/django/forms/widgets.py#L527\n\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n\nExample of a CORRECT response:\n<example_response>\n# Thoughts:\ndef generate_test_to_verify_patch():\n    code='...'\n    save_code_to_file(code, file_path)\n    execute_code_file(file_path)\n    return \n</example_response>\n\n\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Environment Details\n- You have a full tool stack and Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\nsubmit()\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>",
+      "timestamp": 1767573751.029343
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Search for SplitArrayField and related BooleanField/CheckboxInput usage to locate bug.\n@bug_reproduction\ndef grep_for_splitarrayfield_to_locate_bug():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"SplitArrayField|split_array|SplitArray|CheckboxInput|BooleanField\" .')",
+      "timestamp": 1767573754.3959675,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CuSxyjQx3cMqwFY2na5gH0m3k8r0H",
+          "created": 1767573750,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Search for SplitArrayField and related BooleanField/CheckboxInput usage to locate bug.\n@bug_reproduction\ndef grep_for_splitarrayfield_to_locate_bug():\n    return exec_bash_cmd('grep -RIn --include=\"*.py\" -E \"SplitArrayField|split_array|SplitArray|CheckboxInput|BooleanField\" .')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 211,
+            "prompt_tokens": 2278,
+            "total_tokens": 2489,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 128,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning><output_head>\nbash execution output:\n ./django/forms/widgets.py:32:    'DateInput', 'DateTimeInput', 'TimeInput', 'CheckboxInput', 'Select',\n./django/forms/widgets.py:442:        if not self.is_required and CheckboxInput().value_from_datadict(\n./django/forms/widgets.py:502:# Defined at module level so that CheckboxInput is picklable (#17976)\n./django/forms/widgets.py:507:class CheckboxInput(Input):\n./django/forms/widgets.py:707:    A Select Widget intended to be used with NullBooleanField.\n./django/forms/fields.py:21:    FILE_INPUT_CONTRADICTION, CheckboxInput, ClearableFileInput, DateInput,\n./django/forms/fields.py:38:    'BooleanField', 'NullBooleanField', 'ChoiceField', 'MultipleChoiceField',\n./django/forms/fields.py:697:class BooleanField(Field):\n./django/forms/fields.py:698:    widget = CheckboxInput\n./django/forms/fields.py:724:class NullBooleanField(BooleanField):\n./django/forms/formsets.py:3:from django.forms.fields import BooleanField, IntegerField\n./django/forms/formsets.py:391:            form.fields[DELETION_FIELD_NAME] = BooleanField(label=_('Delete'), required=False)\n./django/contrib/auth/models.py:231:    is_superuser = models.BooleanField(\n./django/contrib/auth/models.py:337:    is_staff = models.BooleanField(\n./django/contrib/auth/models.py:342:    is_active = models.BooleanField(\n./django/contrib/auth/migrations/0001_initial.py:58:                ('is_superuser', models.BooleanField(\n./django/contrib/auth/migrations/0001_initial.py:71:                ('is_staff', models.BooleanField(\n./django/contrib/auth/migrations/0001_initial.py:75:                ('is_active', models.BooleanField(\n./django/contrib/gis/utils/layermapping.py:65:        models.BooleanField: (OFTInteger, OFTReal, OFTString),\n./django/contrib/gis/db/models/functions.py:8:    BinaryField, BooleanField, FloatField, IntegerField, TextField, Transform,\n./django/contrib/gis/db/models/functions.py:334:    output_field = BooleanField()\n./django/contrib/flatpages/models.py:12:    enable_comments = models.BooleanField(_('enable comments'), default=False)\n./django/contrib/flatpages/models.py:22:    registration_required = models.BooleanField(\n./django/contrib/flatpages/migrations/0001_initial.py:18:                ('enable_comments', models.BooleanField(default=False, verbose_name='enable comments')),\n./django/contrib/flatpages/migrations/0001_initial.py:25:                ('registration_required', models.BooleanField(\n./django/contrib/postgres/fields/ranges.py:292:    output_field = models.BooleanField()\n./django/contrib/postgres/fields/ranges.py:299:    output_field = models.BooleanField()\n./django/contrib/postgres/fields/ranges.py:306:    output_field = models.BooleanField()\n./django/contrib/postgres/fields/ranges.py:313:    output_field = models.BooleanField()\n./django/contrib/postgres/fields/ranges.py:320:    output_field = models.BooleanField()\n./django/contrib/postgres/forms/array.py:105:class SplitArrayWidget(forms.Widget):\n./django/contrib/postgres/forms/array.py:106:    template_name = 'postgres/widgets/split_array.html'\n./django/contrib/postgres/forms/array.py:168:class SplitArrayField(forms.Field):\n./django/contrib/postgres/forms/array.py:177:        widget = SplitArrayWidget(widget=base_field.widget, size=size)\n./django/contrib/admin/filters.py:232:class BooleanFieldListFilter(FieldListFilter):\n./django/contrib/admin/filters.py:264:FieldListFilter.register(lambda f: isinstance(f, models.BooleanField), BooleanFieldListFilter)\n./django/contrib/admin/filters.py:376:# if a field is eligible to use the BooleanFieldListFilter, that'd be much\n./django/contrib/admin/helpers.py:22:    select_across = forms.BooleanField(\n./django/contrib/admin/helpers.py:30:checkbox = forms.CheckboxInput({'class': 'action-select'}, lambda value: False)\n./django/contrib/admin/helpers.py:127:        self.is_checkbox = isinstance(self.field.field.widget, forms.CheckboxInput)\n./django/contrib/admin/utils.py:385:    # BooleanField needs special-case null-handling, so it comes before the\n./django/contrib/admin/utils.py:387:    elif isinstance(field, models.BooleanField):\n./django/contrib/admin/__init__.py:3:    AllValuesFieldListFilter, BooleanFieldListFilter, ChoicesFieldListFilter,\n./django/contrib/admin/__init__.py:16:    \"FieldListFilter\", \"BooleanFieldListFilter\", \"RelatedFieldListFilter\",\n./django/db/models/fields/__init__.py:32:    'BinaryField', 'BooleanField', 'CharField', 'CommaSeparatedIntegerField',\n./django/db/models/fields/__init__.py:36:    'NullBooleanField', 'PositiveBigIntegerField', 'PositiveIntegerField',\n./django/db/models/fields/__init__.py:927:class BooleanField(Field):\n./django/db/models/fields/__init__.py:936:        return \"BooleanField\"\n./django/db/models/fields/__init__.py:965:            form_class = forms.NullBooleanField if self.null else forms.BooleanField\n./django/db/models/fields/__init__.py:1919:class NullBooleanField(BooleanField):\n./django/db/models/fields/__init__.py:1938:        return \"NullBooleanField\"\n./django/db/models/expre\n</output_head>\n<elided_chars>\n26889 characters elided\n</elided_chars>\n<output_tail>\nenInput, initial=False)\n./tests/forms_tests/field_tests/test_nullbooleanfield.py:50:            nullbool0 = NullBooleanField(widget=RadioSelect(choices=NULLBOOL_CHOICES))\n./tests/forms_tests/field_tests/test_nullbooleanfield.py:51:            nullbool1 = NullBooleanField(widget=RadioSelect(choices=NULLBOOL_CHOICES))\n./tests/forms_tests/field_tests/test_nullbooleanfield.py:52:            nullbool2 = NullBooleanField(widget=RadioSelect(choices=NULLBOOL_CHOICES))\n./tests/forms_tests/field_tests/test_nullbooleanfield.py:60:        f = NullBooleanField()\n./tests/model_inheritance_regress/models.py:18:    serves_hot_dogs = models.BooleanField(default=False)\n./tests/model_inheritance_regress/models.py:19:    serves_pizza = models.BooleanField(default=False)\n./tests/model_inheritance_regress/models.py:26:    serves_gnocchi = models.BooleanField(default=False)\n./tests/model_inheritance_regress/models.py:207:    inbound = models.BooleanField(default=False)\n./tests/backends/oracle/tests.py:4:from django.db.models.fields import BooleanField, NullBooleanField\n./tests/backends/oracle/tests.py:52:        for field in (BooleanField(), NullBooleanField(), BooleanField(null=True)):\n./tests/custom_managers/models.py:98:    fun = models.BooleanField(default=False)\n./tests/custom_managers/models.py:120:    fun = models.BooleanField(default=True)\n./tests/custom_managers/models.py:140:    is_published = models.BooleanField(default=False)\n./tests/custom_managers/models.py:206:    is_public = models.BooleanField(default=False)\n./tests/custom_managers/models.py:218:    is_public = models.BooleanField(default=False)\n./tests/bulk_create/models.py:77:    null_boolean_field = models.BooleanField(null=True, default=False)\n./tests/bulk_create/models.py:78:    null_boolean_field_old = models.NullBooleanField(null=True, default=False)\n./tests/indexes/models.py:30:    published = models.BooleanField(default=False)\n./tests/auth_tests/models/invalid_models.py:14:    is_staff = models.BooleanField(default=False)\n./tests/auth_tests/models/invalid_models.py:15:    is_superuser = models.BooleanField(default=False)\n./tests/auth_tests/models/custom_user.py:38:    is_active = models.BooleanField(default=True)\n./tests/auth_tests/models/custom_user.py:39:    is_admin = models.BooleanField(default=False)\n./tests/auth_tests/models/with_custom_email_field.py:19:    is_active = models.BooleanField(default=True)\n./tests/aggregation_regress/models.py:64:    Exclude = models.BooleanField(default=False)\n./tests/admin_docs/test_views.py:332:            views.get_readable_field_data_type(fields.BooleanField()),\n./tests/annotations/tests.py:6:    BooleanField, CharField, Count, DateTimeField, ExpressionWrapper, F, Func,\n./tests/annotations/tests.py:7:    IntegerField, NullBooleanField, OuterRef, Q, Subquery, Sum, Value,\n./tests/annotations/tests.py:151:            selected=ExpressionWrapper(Q(pk__in=[]), output_field=BooleanField())\n./tests/annotations/tests.py:157:            selected=ExpressionWrapper(Q(pk__in=Book.objects.none()), output_field=BooleanField())\n./tests/annotations/tests.py:371:            is_open=Value(True, BooleanField()),\n./tests/annotations/tests.py:556:            is_book=Value(True, output_field=BooleanField()),\n./tests/annotations/tests.py:557:            is_pony=Value(False, output_field=BooleanField()),\n./tests/annotations/tests.py:558:            is_none=Value(None, output_field=BooleanField(null=True)),\n./tests/annotations/tests.py:559:            is_none_old=Value(None, output_field=NullBooleanField()),\n./tests/annotations/tests.py:588:        with self.assertRaisesMessage(TypeError, msg % BooleanField()):\n./tests/annotations/tests.py:589:            Book.objects.annotate(BooleanField())\n./tests/annotations/tests.py:592:        with self.assertRaisesMessage(TypeError, msg % ', '.join([str(BooleanField()), 'True'])):\n./tests/annotations/tests.py:593:            Book.objects.annotate(BooleanField(), Value(False), is_book=True)\n./tests/annotations/models.py:59:    manager = models.BooleanField(default=False)\n./tests/queries/models.py:216:    public = models.BooleanField(default=True)\n./tests/queries/models.py:650:    parent_bool = models.BooleanField(default=True)\n./tests/queries/models.py:687:    has_blackboard = models.BooleanField(null=True)\n./tests/queries/models.py:709:    field_b1 = models.BooleanField(default=False)\n./tests/queries/models.py:718:    alive = models.BooleanField()\n./tests/queries/test_query.py:4:from django.db.models import BooleanField, CharField, F, Q\n./tests/queries/test_query.py:135:        where = query.build_where(Func(output_field=BooleanField()))\n./tests/queries/test_query.py:143:        filter_expr = Func('note__note', output_field=BooleanField())\n./tests/schema/tests.py:15:    AutoField, BigAutoField, BigIntegerField, BinaryField, BooleanField,\n./tests/schema/tests.py:523:        new_field = BooleanField(default=False)\n./tests/schema/tests.py:529:        # BooleanField are stored as TINYINT(1) on MySQL.\n\n\n</output_tail>",
+      "timestamp": 1767573755.6321177
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Open the SplitArrayWidget/Field implementation to inspect where final_attrs is reused and passed to widget.get_context.\n@bug_localization\ndef print_splitarray_file_to_inspect():\n    return print_code_context('django/contrib/postgres/forms/array.py', (1, 260))",
+      "timestamp": 1767573760.6705668,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CuSy3zbFjQRm1IgTtMyttLSdovY25",
+          "created": 1767573755,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Open the SplitArrayWidget/Field implementation to inspect where final_attrs is reused and passed to widget.get_context.\n@bug_localization\ndef print_splitarray_file_to_inspect():\n    return print_code_context('django/contrib/postgres/forms/array.py', (1, 260))",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 326,
+            "prompt_tokens": 4892,
+            "total_tokens": 5218,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 256,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 1792,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nWarning: End line 260 exceeds file length (234 lines)\n   1 import copy\n   2 from itertools import chain\n   3 \n   4 from django import forms\n   5 from django.contrib.postgres.validators import (\n   6     ArrayMaxLengthValidator, ArrayMinLengthValidator,\n   7 )\n   8 from django.core.exceptions import ValidationError\n   9 from django.utils.translation import gettext_lazy as _\n  10 \n  11 from ..utils import prefix_validation_error\n  12 \n  13 \n  14 class SimpleArrayField(forms.CharField):\n  15     default_error_messages = {\n  16         'item_invalid': _('Item %(nth)s in the array did not validate:'),\n  17     }\n  18 \n  19     def __init__(self, base_field, *, delimiter=',', max_length=None, min_length=None, **kwargs):\n  20         self.base_field = base_field\n  21         self.delimiter = delimiter\n  22         super().__init__(**kwargs)\n  23         if min_length is not None:\n  24             self.min_length = min_length\n  25             self.validators.append(ArrayMinLengthValidator(int(min_length)))\n  26         if max_length is not None:\n  27             self.max_length = max_length\n  28             self.validators.append(ArrayMaxLengthValidator(int(max_length)))\n  29 \n  30     def clean(self, value):\n  31         value = super().clean(value)\n  32         return [self.base_field.clean(val) for val in value]\n  33 \n  34     def prepare_value(self, value):\n  35         if isinstance(value, list):\n  36             return self.delimiter.join(str(self.base_field.prepare_value(v)) for v in value)\n  37         return value\n  38 \n  39     def to_python(self, value):\n  40         if isinstance(value, list):\n  41             items = value\n  42         elif value:\n  43             items = value.split(self.delimiter)\n  44         else:\n  45             items = []\n  46         errors = []\n  47         values = []\n  48         for index, item in enumerate(items):\n  49             try:\n  50                 values.append(self.base_field.to_python(item))\n  51             except ValidationError as error:\n  52                 errors.append(prefix_validation_error(\n  53                     error,\n  54                     prefix=self.error_messages['item_invalid'],\n  55                     code='item_invalid',\n  56                     params={'nth': index + 1},\n  57                 ))\n  58         if errors:\n  59             raise ValidationError(errors)\n  60         return values\n  61 \n  62     def validate(self, value):\n  63         super().validate(value)\n  64         errors = []\n  65         for index, item in enumerate(value):\n  66             try:\n  67                 self.base_field.validate(item)\n  68             except ValidationError as error:\n  69                 errors.append(prefix_validation_error(\n  70                     error,\n  71                     prefix=self.error_messages['item_invalid'],\n  72                     code='item_invalid',\n  73                     params={'nth': index + 1},\n  74                 ))\n  75         if errors:\n  76             raise ValidationError(errors)\n  77 \n  78     def run_validators(self, value):\n  79         super().run_validators(value)\n  80         errors = []\n  81         for index, item in enumerate(value):\n  82             try:\n  83                 self.base_field.run_validators(item)\n  84             except ValidationError as error:\n  85                 errors.append(prefix_validation_error(\n  86                     error,\n  87                     prefix=self.error_messages['item_invalid'],\n  88                     code='item_invalid',\n  89                     params={'nth': index + 1},\n  90                 ))\n  91         if errors:\n  92             raise ValidationError(errors)\n  93 \n  94     def has_changed(self, initial, data):\n  95         try:\n  96             value = self.to_python(data)\n  97         except ValidationError:\n  98             pass\n  99         else:\n 100             if initial in self.empty_values and value in self.empty_values:\n 101                 return False\n 102         return super().has_changed(initial, data)\n 103 \n 104 \n 105 class SplitArrayWidget(forms.Widget):\n 106     template_name = 'postgres/widgets/split_array.html'\n 107 \n 108     def __init__(self, widget, size, **kwargs):\n 109         self.widget = widget() if isinstance(widget, type) else widget\n 110         self.size = size\n 111         super().__init__(**kwargs)\n 112 \n 113     @property\n 114     def is_hidden(self):\n 115         return self.widget.is_hidden\n 116 \n 117     def value_from_datadict(self, data, files, name):\n 118         return [self.widget.value_from_datadict(data, files, '%s_%s' % (name, index))\n 119                 for index in range(self.size)]\n 120 \n 121     def value_omitted_from_data(self, data, files, name):\n 122         return all(\n 123             self.widget.value_omitted_from_data(data, files, '%s_%s' % (name, index))\n 124             for index in range(self.size)\n 125         )\n 126 \n 127     def id_for_label(self, id_):\n 129         if id_:\n 130             id_ += '_0'\n 131         return id_\n 132 \n 133     def get_context(self, name, value, attrs=None):\n 134         attrs = {} if attrs is None else attrs\n 135         context = super().get_context(name, value, attrs)\n 136         if self.is_localized:\n 137             self.widget.is_localized = self.is_localized\n 138         value = value or []\n 139         context['widget']['subwidgets'] = []\n 140         final_attrs = self.build_attrs(attrs)\n 141         id_ = final_attrs.get('id')\n 142         for i in range(max(len(value), self.size)):\n 143             try:\n 144                 widget_value = value[i]\n 145             except IndexError:\n 146                 widget_value = None\n 147             if id_:\n 148                 final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n 149             context['widget']['subwidgets'].append(\n 150                 self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']\n 151             )\n 152         return context\n 153 \n 154     @property\n 155     def media(self):\n 156         return self.widget.media\n 157 \n 158     def __deepcopy__(self, memo):\n 159         obj = super().__deepcopy__(memo)\n 160         obj.widget = copy.deepcopy(self.widget)\n 161         return obj\n 162 \n 163     @property\n 164     def needs_multipart_form(self):\n 165         return self.widget.needs_multipart_form\n 166 \n 167 \n 168 class SplitArrayField(forms.Field):\n 169     default_error_messages = {\n 170         'item_invalid': _('Item %(nth)s in the array did not validate:'),\n 171     }\n 172 \n 173     def __init__(self, base_field, size, *, remove_trailing_nulls=False, **kwargs):\n 174         self.base_field = base_field\n 175         self.size = size\n 176         self.remove_trailing_nulls = remove_trailing_nulls\n 177         widget = SplitArrayWidget(widget=base_field.widget, size=size)\n 178         kwargs.setdefault('widget', widget)\n 179         super().__init__(**kwargs)\n 180 \n 181     def _remove_trailing_nulls(self, values):\n 182         index = None\n 183         if self.remove_trailing_nulls:\n 184             for i, value in reversed(list(enumerate(values))):\n 185                 if value in self.base_field.empty_values:\n 186                     index = i\n 187                 else:\n 188                     break\n 189             if index is not None:\n 190                 values = values[:index]\n 191         return values, index\n 192 \n 193     def to_python(self, value):\n 194         value = super().to_python(value)\n 195         return [self.base_field.to_python(item) for item in value]\n 196 \n 197     def clean(self, value):\n 198         cleaned_data = []\n 199         errors = []\n 200         if not any(value) and self.required:\n 201             raise ValidationError(self.error_messages['required'])\n 202         max_size = max(self.size, len(value))\n 203         for index in range(max_size):\n 204             item = value[index]\n 205             try:\n 206                 cleaned_data.append(self.base_field.clean(item))\n 207             except ValidationError as error:\n 208                 errors.append(prefix_validation_error(\n 209                     error,\n 210                     self.error_messages['item_invalid'],\n 211                     code='item_invalid',\n 212                     params={'nth': index + 1},\n 213                 ))\n 214                 cleaned_data.append(None)\n 215             else:\n 216                 errors.append(None)\n 217         cleaned_data, null_index = self._remove_trailing_nulls(cleaned_data)\n 218         if null_index is not None:\n 219             errors = errors[:null_index]\n 220         errors = list(filter(None, errors))\n 221         if errors:\n 222             raise ValidationError(list(chain.from_iterable(errors)))\n 223         return cleaned_data\n 224 \n 225     def has_changed(self, initial, data):\n 226         try:\n 227             data = self.to_python(data)\n 228         except ValidationError:\n 229             pass\n 230         else:\n 231             data, _ = self._remove_trailing_nulls(data)\n 232             if initial in self.empty_values and data in self.empty_values:\n 233                 return False\n 234         return super().has_changed(initial, data)\n</output>",
+      "timestamp": 1767573760.9248679
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Patch SplitArrayWidget.get_context to pass a fresh attrs copy to each subwidget to avoid CheckboxInput mutating shared dict.\n@patch_generation\ndef replace_final_attrs_with_per_widget_copy_to_fix_checkbox_checked_propagation():\n    return exec_bash_cmd(r\"\"\"python - <<'PY'\nfrom pathlib import Path\np=Path('django/contrib/postgres/forms/array.py')\ns=p.read_text()\nold=(\"            if id_:\\n\"\n     \"                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}\\n\"\n     \"            context['widget']['subwidgets'].append(\\n\"\n     \"                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']\\n\"\n     \"            )\")\nnew=(\"            if id_:\\n\"\n     \"                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\\n\"\n     \"            else:\\n\"\n     \"                attrs_i = dict(final_attrs)\\n\"\n     \"            context['widget']['subwidgets'].append(\\n\"\n     \"                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\\n\"\n     \"            )\")\nif old in s:\n    s=s.replace(old,new)\n    p.write_text(s)\n    print('patched')\nelse:\n    print('pattern not found')\nPY\n\"\"\")",
+      "timestamp": 1767573783.4337685,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CuSy8TchOi7OlKMJe2ymhXbBk6zmt",
+          "created": 1767573760,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Patch SplitArrayWidget.get_context to pass a fresh attrs copy to each subwidget to avoid CheckboxInput mutating shared dict.\n@patch_generation\ndef replace_final_attrs_with_per_widget_copy_to_fix_checkbox_checked_propagation():\n    return exec_bash_cmd(r\"\"\"python - <<'PY'\nfrom pathlib import Path\np=Path('django/contrib/postgres/forms/array.py')\ns=p.read_text()\nold=(\"            if id_:\\n\"\n     \"                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}\\n\"\n     \"            context['widget']['subwidgets'].append(\\n\"\n     \"                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']\\n\"\n     \"            )\")\nnew=(\"            if id_:\\n\"\n     \"                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\\n\"\n     \"            else:\\n\"\n     \"                attrs_i = dict(final_attrs)\\n\"\n     \"            context['widget']['subwidgets'].append(\\n\"\n     \"                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\\n\"\n     \"            )\")\nif old in s:\n    s=s.replace(old,new)\n    p.write_text(s)\n    print('patched')\nelse:\n    print('pattern not found')\nPY\n\"\"\")",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1788,
+            "prompt_tokens": 7185,
+            "total_tokens": 8973,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 1472,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 3840,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n patched\n\n</output>",
+      "timestamp": 1767573783.7276106
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Create and run a short script to verify subwidget attrs do not retain 'checked' after first True.\n@test_generation\ndef generate_and_run_repro_script_to_verify_patch():\n    code = r\"\"\"\nfrom django import forms\nfrom django.contrib.postgres.forms.array import SplitArrayWidget\nimport pprint\n\nw = SplitArrayWidget(widget=forms.CheckboxInput, size=4)\nctx = w.get_context('field', [True, False, False, True], {'id': 'id_field'})\nfor i, sub in enumerate(ctx['widget']['subwidgets']):\n    print(f\"index={i}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\n\"\"\"\n    save_code_to_file('repro_splitarray_checkbox.py', code)\n    return exec_bash_cmd('python repro_splitarray_checkbox.py')",
+      "timestamp": 1767573795.2179267,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CuSyVimmL5gX849KT9U31ndkruXOC",
+          "created": 1767573783,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Create and run a short script to verify subwidget attrs do not retain 'checked' after first True.\n@test_generation\ndef generate_and_run_repro_script_to_verify_patch():\n    code = r\"\"\"\nfrom django import forms\nfrom django.contrib.postgres.forms.array import SplitArrayWidget\nimport pprint\n\nw = SplitArrayWidget(widget=forms.CheckboxInput, size=4)\nctx = w.get_context('field', [True, False, False, True], {'id': 'id_field'})\nfor i, sub in enumerate(ctx['widget']['subwidgets']):\n    print(f\"index={i}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\n\"\"\"\n    save_code_to_file('repro_splitarray_checkbox.py', code)\n    return exec_bash_cmd('python repro_splitarray_checkbox.py')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 884,
+            "prompt_tokens": 7523,
+            "total_tokens": 8407,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 704,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 7040,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n Traceback (most recent call last):\n  File \"repro_splitarray_checkbox.py\", line 3, in <module>\n    from django.contrib.postgres.forms.array import SplitArrayWidget\n  File \"/testbed/django/contrib/postgres/forms/__init__.py\", line 4, in <module>\n    from .ranges import *  # NOQA\n  File \"/testbed/django/contrib/postgres/forms/ranges.py\", line 1, in <module>\n    from psycopg2.extras import DateRange, DateTimeTZRange, NumericRange\nModuleNotFoundError: No module named 'psycopg2'\n\n</output>",
+      "timestamp": 1767573795.6219635
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Show patched region to confirm change and run an isolated repro using a minimal Widget/CheckboxInput to verify attrs copying prevents checked propagation.\n@test_generation\ndef show_patch_and_run_isolated_repro():\n    exec_bash_cmd(\"nl -ba django/contrib/postgres/forms/array.py | sed -n '120,160p' > /tmp/array_snip.txt && sed -n '120,160p' /tmp/array_snip.txt\")\n    code = r\"\"\"\n# Minimal local repro of SplitArrayWidget.get_context behavior without importing django package\nclass FakeWidgetBase:\n    def __init__(self, *args, **kwargs):\n        self.is_hidden = False\n        self.is_localized = False\n        self.media = None\n    def get_context(self, name, value, attrs=None):\n        return {'widget': {'name': name, 'value': value, 'attrs': attrs or {}}}\n    def build_attrs(self, base_attrs, extra_attrs=None):\n        a = dict(base_attrs or {})\n        if extra_attrs:\n            a.update(extra_attrs)\n        return a\n\nclass MutatingCheckbox:\n    def __init__(self):\n        pass\n    def get_context(self, name, value, attrs=None):\n        if attrs is None:\n            attrs = {}\n        # BUGGY widget: mutates the attrs dict by setting 'checked' when value is truthy\n        if value:\n            attrs['checked'] = True\n        elif 'checked' in attrs:\n            # simulate widget leaving checked if not careful (it only sets when True)\n            pass\n        return {'widget': {'name': name, 'value': value, 'attrs': attrs}}\n\nclass SplitArrayWidget:\n    def __init__(self, widget, size, **kwargs):\n        self.widget = widget() if isinstance(widget, type) else widget\n        self.size = size\n        self.is_localized = False\n    @property\n    def is_hidden(self):\n        return self.widget.is_hidden\n    def build_attrs(self, attrs):\n        return dict(attrs or {})\n    def get_context(self, name, value, attrs=None):\n        attrs = {} if attrs is None else attrs\n        # simulate super().get_context returning a dict with 'widget'\n        context = {'widget': {}}\n        value = value or []\n        context['widget']['subwidgets'] = []\n        final_attrs = self.build_attrs(attrs)\n        id_ = final_attrs.get('id')\n        for i in range(max(len(value), self.size)):\n            try:\n                widget_value = value[i]\n            except IndexError:\n                widget_value = None\n            if id_:\n                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n            else:\n                attrs_i = dict(final_attrs)\n            context['widget']['subwidgets'].append(\n                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\n            )\n        return context\n\nw = SplitArrayWidget(widget=MutatingCheckbox, size=4)\nctx = w.get_context('field', [True, False, False, True], {'id':'id_field'})\nfor i, sub in enumerate(ctx['widget']['subwidgets']):\n    print(f\"index={i}, value={sub['value']}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\n\"\"\"\n    save_code_to_file('isolated_repro.py', code)\n    return exec_bash_cmd('python isolated_repro.py')",
+      "timestamp": 1767573832.1196342,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CuSyh9yuwpT1tzirqCfTcR3GO88S9",
+          "created": 1767573795,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Show patched region to confirm change and run an isolated repro using a minimal Widget/CheckboxInput to verify attrs copying prevents checked propagation.\n@test_generation\ndef show_patch_and_run_isolated_repro():\n    exec_bash_cmd(\"nl -ba django/contrib/postgres/forms/array.py | sed -n '120,160p' > /tmp/array_snip.txt && sed -n '120,160p' /tmp/array_snip.txt\")\n    code = r\"\"\"\n# Minimal local repro of SplitArrayWidget.get_context behavior without importing django package\nclass FakeWidgetBase:\n    def __init__(self, *args, **kwargs):\n        self.is_hidden = False\n        self.is_localized = False\n        self.media = None\n    def get_context(self, name, value, attrs=None):\n        return {'widget': {'name': name, 'value': value, 'attrs': attrs or {}}}\n    def build_attrs(self, base_attrs, extra_attrs=None):\n        a = dict(base_attrs or {})\n        if extra_attrs:\n            a.update(extra_attrs)\n        return a\n\nclass MutatingCheckbox:\n    def __init__(self):\n        pass\n    def get_context(self, name, value, attrs=None):\n        if attrs is None:\n            attrs = {}\n        # BUGGY widget: mutates the attrs dict by setting 'checked' when value is truthy\n        if value:\n            attrs['checked'] = True\n        elif 'checked' in attrs:\n            # simulate widget leaving checked if not careful (it only sets when True)\n            pass\n        return {'widget': {'name': name, 'value': value, 'attrs': attrs}}\n\nclass SplitArrayWidget:\n    def __init__(self, widget, size, **kwargs):\n        self.widget = widget() if isinstance(widget, type) else widget\n        self.size = size\n        self.is_localized = False\n    @property\n    def is_hidden(self):\n        return self.widget.is_hidden\n    def build_attrs(self, attrs):\n        return dict(attrs or {})\n    def get_context(self, name, value, attrs=None):\n        attrs = {} if attrs is None else attrs\n        # simulate super().get_context returning a dict with 'widget'\n        context = {'widget': {}}\n        value = value or []\n        context['widget']['subwidgets'] = []\n        final_attrs = self.build_attrs(attrs)\n        id_ = final_attrs.get('id')\n        for i in range(max(len(value), self.size)):\n            try:\n                widget_value = value[i]\n            except IndexError:\n                widget_value = None\n            if id_:\n                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n            else:\n                attrs_i = dict(final_attrs)\n            context['widget']['subwidgets'].append(\n                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\n            )\n        return context\n\nw = SplitArrayWidget(widget=MutatingCheckbox, size=4)\nctx = w.get_context('field', [True, False, False, True], {'id':'id_field'})\nfor i, sub in enumerate(ctx['widget']['subwidgets']):\n    print(f\"index={i}, value={sub['value']}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\n\"\"\"\n    save_code_to_file('isolated_repro.py', code)\n    return exec_bash_cmd('python isolated_repro.py')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 2659,
+            "prompt_tokens": 7857,
+            "total_tokens": 10516,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 1920,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 7040,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n \nbash execution output:\n index=0, value=True, checked=True, attrs={'id': 'id_field_0', 'checked': True}\nindex=1, value=False, checked=None, attrs={'id': 'id_field_1'}\nindex=2, value=False, checked=None, attrs={'id': 'id_field_2'}\nindex=3, value=True, checked=True, attrs={'id': 'id_field_3', 'checked': True}\n\n</output>",
+      "timestamp": 1767573832.387099
+    },
+    {
+      "role": "assistant",
+      "content": "# Thoughts: Verify the patched file compiles and re-run the isolated repro to ensure no syntax errors.\n@patch_verification\ndef compile_and_rerun_isolated_repro_to_verify_patch():\n    return exec_bash_cmd('python -m py_compile django/contrib/postgres/forms/array.py && python isolated_repro.py')",
+      "timestamp": 1767573851.9414685,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CuSzI9qrGplDI3BJ6KprvZlnV1S5F",
+          "created": 1767573832,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "# Thoughts: Verify the patched file compiles and re-run the isolated repro to ensure no syntax errors.\n@patch_verification\ndef compile_and_rerun_isolated_repro_to_verify_patch():\n    return exec_bash_cmd('python -m py_compile django/contrib/postgres/forms/array.py && python isolated_repro.py')",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 781,
+            "prompt_tokens": 8710,
+            "total_tokens": 9491,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 704,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 7808,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nbash execution output:\n index=0, value=True, checked=True, attrs={'id': 'id_field_0', 'checked': True}\nindex=1, value=False, checked=None, attrs={'id': 'id_field_1'}\nindex=2, value=False, checked=None, attrs={'id': 'id_field_2'}\nindex=3, value=True, checked=True, attrs={'id': 'id_field_3', 'checked': True}\n\n</output>",
+      "timestamp": 1767573852.1903565
+    },
+    {
+      "role": "assistant",
+      "content": "submit()",
+      "timestamp": 1767573863.7748404,
+      "extra": {
+        "response": {
+          "id": "chatcmpl-CuSzcCk5VcIdEOqu2aEmhlmydfCqN",
+          "created": 1767573852,
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "submit()",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": {
+                  "refusal": null
+                },
+                "annotations": []
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 331,
+            "prompt_tokens": 8897,
+            "total_tokens": 9228,
+            "completion_tokens_details": {
+              "accepted_prediction_tokens": 0,
+              "audio_tokens": 0,
+              "reasoning_tokens": 320,
+              "rejected_prediction_tokens": 0,
+              "text_tokens": null,
+              "image_tokens": null
+            },
+            "prompt_tokens_details": {
+              "audio_tokens": 0,
+              "cached_tokens": 7936,
+              "text_tokens": null,
+              "image_tokens": null
+            }
+          },
+          "service_tier": "default"
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "diff --git a/django/contrib/postgres/forms/array.py b/django/contrib/postgres/forms/array.py\nindex 2e19cd574a..2de04c9d89 100644\n--- a/django/contrib/postgres/forms/array.py\n+++ b/django/contrib/postgres/forms/array.py\n@@ -145,9 +145,11 @@ class SplitArrayWidget(forms.Widget):\n             except IndexError:\n                 widget_value = None\n             if id_:\n-                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n+                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n+            else:\n+                attrs_i = dict(final_attrs)\n             context['widget']['subwidgets'].append(\n-                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']\n+                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\n             )\n         return context\n \ndiff --git a/isolated_repro.py b/isolated_repro.py\nnew file mode 100644\nindex 0000000000..b0bab3532a\n--- /dev/null\n+++ b/isolated_repro.py\n@@ -0,0 +1,65 @@\n+\n+# Minimal local repro of SplitArrayWidget.get_context behavior without importing django package\n+class FakeWidgetBase:\n+    def __init__(self, *args, **kwargs):\n+        self.is_hidden = False\n+        self.is_localized = False\n+        self.media = None\n+    def get_context(self, name, value, attrs=None):\n+        return {'widget': {'name': name, 'value': value, 'attrs': attrs or {}}}\n+    def build_attrs(self, base_attrs, extra_attrs=None):\n+        a = dict(base_attrs or {})\n+        if extra_attrs:\n+            a.update(extra_attrs)\n+        return a\n+\n+class MutatingCheckbox:\n+    def __init__(self):\n+        pass\n+    def get_context(self, name, value, attrs=None):\n+        if attrs is None:\n+            attrs = {}\n+        # BUGGY widget: mutates the attrs dict by setting 'checked' when value is truthy\n+        if value:\n+            attrs['checked'] = True\n+        elif 'checked' in attrs:\n+            # simulate widget leaving checked if not careful (it only sets when True)\n+            pass\n+        return {'widget': {'name': name, 'value': value, 'attrs': attrs}}\n+\n+class SplitArrayWidget:\n+    def __init__(self, widget, size, **kwargs):\n+        self.widget = widget() if isinstance(widget, type) else widget\n+        self.size = size\n+        self.is_localized = False\n+    @property\n+    def is_hidden(self):\n+        return self.widget.is_hidden\n+    def build_attrs(self, attrs):\n+        return dict(attrs or {})\n+    def get_context(self, name, value, attrs=None):\n+        attrs = {} if attrs is None else attrs\n+        # simulate super().get_context returning a dict with 'widget'\n+        context = {'widget': {}}\n+        value = value or []\n+        context['widget']['subwidgets'] = []\n+        final_attrs = self.build_attrs(attrs)\n+        id_ = final_attrs.get('id')\n+        for i in range(max(len(value), self.size)):\n+            try:\n+                widget_value = value[i]\n+            except IndexError:\n+                widget_value = None\n+            if id_:\n+                attrs_i = {**final_attrs, 'id': '%s_%s' % (id_, i)}\n+            else:\n+                attrs_i = dict(final_attrs)\n+            context['widget']['subwidgets'].append(\n+                self.widget.get_context(name + '_%s' % i, widget_value, attrs_i)['widget']\n+            )\n+        return context\n+\n+w = SplitArrayWidget(widget=MutatingCheckbox, size=4)\n+ctx = w.get_context('field', [True, False, False, True], {'id':'id_field'})\n+for i, sub in enumerate(ctx['widget']['subwidgets']):\n+    print(f\"index={i}, value={sub['value']}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\ndiff --git a/repro_splitarray_checkbox.py b/repro_splitarray_checkbox.py\nnew file mode 100644\nindex 0000000000..3fade56d79\n--- /dev/null\n+++ b/repro_splitarray_checkbox.py\n@@ -0,0 +1,9 @@\n+\n+from django import forms\n+from django.contrib.postgres.forms.array import SplitArrayWidget\n+import pprint\n+\n+w = SplitArrayWidget(widget=forms.CheckboxInput, size=4)\n+ctx = w.get_context('field', [True, False, False, True], {'id': 'id_field'})\n+for i, sub in enumerate(ctx['widget']['subwidgets']):\n+    print(f\"index={i}, checked={sub['attrs'].get('checked')}, attrs={sub['attrs']}\")\n\n",
+      "timestamp": 1767573864.8142583
+    }
+  ],
+  "trajectory_format": "mini-swe-agent-1",
+  "instance_id": "django__django-12193"
+}
