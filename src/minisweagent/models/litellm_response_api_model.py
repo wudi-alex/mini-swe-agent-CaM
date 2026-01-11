@@ -76,4 +76,7 @@ class LitellmResponseAPIModel(LitellmModel):
         GLOBAL_MODEL_STATS.add(cost)
         return {
             "content": text,
+            "extra": {
+                "response": response.model_dump(),
+            },
         }

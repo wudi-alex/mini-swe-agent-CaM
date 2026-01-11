@@ -18,6 +18,8 @@ subcommands = [
     ("minisweagent.run.extra.swebench_single", ["swebench-single"], "Evaluate on SWE-bench (single instance)"),
     ("minisweagent.run.extra.swebench_single_cam", ["swebench-single-cam"], "Evaluate on SWE-bench (single instance)"),
     ("minisweagent.run.extra.swebench_cam", ["swebench-cam"], "Evaluate on SWE-bench (batch mode)"),
+    ("minisweagent.run.extra.swebench_exp", ["swebench-exp"], "Evaluate on SWE-bench experiements"),
+    ("minisweagent.run.extra.swebench_single_exp", ["swebench-single-exp"], "Evaluate on SWE-bench experiements"),
 ]
 
 

@@ -108,7 +108,7 @@ class DefaultAgent:
         try:
             output = self.env.execute(action["action"])
         except (TimeoutError, subprocess.TimeoutExpired) as e:
-            output = e.output.decode("utf-8", errors="replace") if getattr(e, "output", None) else ""
+            output = (e.output.decode("utf-8", errors="replace") if isinstance(e.output, bytes) else e.output) if getattr(e, "output", None) else ""
             raise ExecutionTimeoutError(
                 self.render_template(self.config.timeout_template, action=action, output=output)
             )
