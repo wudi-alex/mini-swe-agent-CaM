@@ -84,17 +84,21 @@ class ProgressTrackingAgent(DefaultAgent):
         except FileNotFoundError:
             raise FileNotFoundError("tools.py file not found in current directory")
 
-        # 提取函数名（从 def function_name(): 中提取）
-        func_name_match = re.search(r'def\s+(\w+)\s*\(', function_code)
-        if not func_name_match and function_code != 'submit()':
+        # 提取所有函数名（从 def function_name(): 中提取）
+        func_name_matches = re.findall(r'def\s+(\w+)\s*\(', function_code)
+
+        # 特殊处理 submit() 情况
+        if function_code == 'submit()':
+            full_code = f"{tools_code}\n\n{function_code}"
+        elif not func_name_matches:
             raise FormatError(
                 f"Could not extract function name from response. "
                 f"Expected format: def action(): ..."
             )
-        func_name = func_name_match.group(1) if function_code != 'submit()' else None
-
-        # 拼接完整代码：tools定义 + agent函数 + 函数调用
-        full_code = f"{tools_code}\n\n{function_code}\n\n{func_name}()" if function_code != 'submit()' else f"{tools_code}\n\n{function_code}"
+        else:
+            # 拼接完整代码：tools定义 + agent函数定义 + 依次调用所有函数
+            function_calls = '\n'.join([f"{func_name}()" for func_name in func_name_matches])
+            full_code = f"{tools_code}\n\n{function_code}\n\n{function_calls}"
 
         # 转义代码中的特殊字符用于shell命令
         # 将单引号替换为 '\'' (结束单引号、转义单引号、开始新单引号)
