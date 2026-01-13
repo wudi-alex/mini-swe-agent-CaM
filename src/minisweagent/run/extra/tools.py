@@ -2,18 +2,42 @@ import subprocess
 import textwrap
 import sys
 import re
+import base64
+
+
+def exec_code(code_string):
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
+
+    try:
+        exec(code_string)
+        output = sys.stdout.getvalue()
+        sys.stdout = old_stdout
+        print(output)
+    except Exception as e:
+        sys.stdout = old_stdout
+        print(f"Error: {e}")
 
 
 def exec_bash_cmd(cmd, timeout=None, auto_fix=True, max_retries=2):
+    """
+    Execute bash command with automatic escaping error fixes.
+
+    Handles complex Python code with nested quotes by using temp files.
+    Auto-retries on syntax/escaping errors using progressively safer methods.
+    """
     cmd = textwrap.dedent(cmd).strip()
 
-    original_cmd = cmd
-    retry_count = 0
+    if auto_fix and _needs_heredoc_fix(cmd):
+        cmd = _fix_heredoc_to_tempfile(cmd)
 
-    while retry_count <= max_retries:
+    original_cmd = cmd
+
+    for attempt in range(max_retries + 1):
         try:
-            if retry_count > 0 and auto_fix:
-                cmd = _auto_fix_bash_escaping(original_cmd, retry_count)
+            if attempt > 0 and auto_fix:
+                cmd = _retry_with_fix(original_cmd, attempt)
+                print(f"[AUTO-FIX] Retry {attempt}: Using safer execution method")
 
             result = subprocess.run(
                 cmd,
@@ -31,20 +55,19 @@ def exec_bash_cmd(cmd, timeout=None, auto_fix=True, max_retries=2):
             try:
                 print('bash execution output:\n', output)
             except UnicodeEncodeError:
-                terminal_encoding = sys.stdout.encoding or 'ascii'
-                safe_output = output.encode(terminal_encoding, errors='replace').decode(terminal_encoding)
+                encoding = sys.stdout.encoding or 'ascii'
+                safe_output = output.encode(encoding, errors='replace').decode(encoding)
                 print('bash execution output:\n', safe_output)
 
             if result.returncode != 0:
                 print(f"Command exited with non-zero status: {result.returncode}")
-
-                if auto_fix and retry_count < max_retries and _is_escaping_error(output):
-                    retry_count += 1
+                if auto_fix and attempt < max_retries and _is_syntax_error(output):
                     continue
-
                 return output
-            # if retry_count > 0:
-            #     print(f"[AUTO-FIX] Successfully fixed after {retry_count} attempt(s)")
+
+            if attempt > 0:
+                print(f"[AUTO-FIX] Fixed after {attempt} attempt(s)")
+
             return output
 
         except subprocess.TimeoutExpired:
@@ -53,124 +76,120 @@ def exec_bash_cmd(cmd, timeout=None, auto_fix=True, max_retries=2):
 
         except Exception as e:
             print(f"Execution failed: {e}")
-
-            if auto_fix and retry_count < max_retries and _is_escaping_error(str(e)):
-                retry_count += 1
+            if auto_fix and attempt < max_retries:
                 continue
-
             return str(e)
 
         finally:
-            print("""Directly response 'submit()' to finish, no other tokens.""")
+            if attempt == 0 or attempt >= max_retries:
+                print("Limit your response to exactly one function definition per turn!")
+                print("Response with 'submit()' to finish!")
 
     return "Failed after all retry attempts"
 
 
-def _is_escaping_error(error_msg):
-    """检测是否是转义相关的错误"""
-    escaping_patterns = [
-        r"unexpected.*quote",
-        r"unterminated.*string",
-        r"unmatched.*quote",
-        r"syntax error.*quote",
-        r"invalid syntax.*quote",
-        r"EOL while scanning",
-        r"unexpected token",
-        r"bad substitution",
-        r"command not found.*['\"]",
+def _needs_heredoc_fix(cmd):
+    """Check if command contains HEREDOC with complex quotes."""
+    if 'python' not in cmd.lower() or '<<' not in cmd:
+        return False
+
+    code = _extract_heredoc(cmd)
+    if not code:
+        return False
+
+    complex_patterns = [
+        r'["\'].*%[sd].*["\']',
+        r'["\'].*\\["\'].*["\']',
+        r'f["\'].*\{.*\}.*["\']',
     ]
-
-    error_lower = error_msg.lower()
-    return any(re.search(pattern, error_lower, re.IGNORECASE) for pattern in escaping_patterns)
+    return any(re.search(p, code) for p in complex_patterns)
 
 
-def _auto_fix_bash_escaping(cmd, attempt):
-    """
-    自动修复常见的 bash 转义问题
+def _extract_heredoc(cmd):
+    """Extract Python code from HEREDOC format."""
+    match = re.search(r'python[3]?\s+(?:-\s+)?<<[\'"]?(\w+)[\'"]?\s*\n(.*?)\n\1',
+                      cmd, re.DOTALL)
+    return match.group(2) if match else None
 
-    策略：
-    1. 第一次重试：如果检测到 python 代码，使用 HEREDOC
-    2. 第二次重试：使用 base64 编码避免所有转义问题
-    """
+
+def _fix_heredoc_to_tempfile(cmd):
+    """Convert HEREDOC to bash tempfile execution (most reliable method)."""
+    code = _extract_heredoc(cmd)
+    if not code:
+        return cmd
+
+    python_cmd = 'python3' if 'python3' in cmd else 'python'
+
+    post_match = re.search(r'<<[\'"]?\w+[\'"]?\s*\n.*?\n\w+\s*\n(.*)', cmd, re.DOTALL)
+    post_cmds = post_match.group(1).strip() if post_match else ''
+
+    new_cmd = f'''tmpfile=$(mktemp --suffix=.py)
+cat > "$tmpfile" <<'EOF'
+{code}
+EOF
+{python_cmd} "$tmpfile"
+ret=$?
+rm -f "$tmpfile"
+'''
+
+    if post_cmds:
+        new_cmd += f"(exit $ret) && {post_cmds}"
+    else:
+        new_cmd += "exit $ret"
+
+    return new_cmd
+
+
+def _is_syntax_error(output):
+    """Detect syntax/escaping errors in output."""
+    error_patterns = [
+        'SyntaxError', 'unexpected.*quote', 'unterminated.*string',
+        'invalid syntax', 'unexpected token', 'EOL while scanning'
+    ]
+    return any(re.search(p, output, re.I) for p in error_patterns)
+
+
+def _retry_with_fix(cmd, attempt):
+    """Apply progressively safer fix strategies."""
     if attempt == 1:
-        # 策略 1: 检测是否包含 Python 代码，使用 HEREDOC
-        if _contains_python_code(cmd):
-            return _convert_to_heredoc(cmd)
-        else:
-            # 对于非 Python 命令，转义特殊字符
-            return _escape_special_chars(cmd)
+        code = _extract_heredoc(cmd) or _extract_python_c(cmd)
+        if code:
+            return _make_tempfile_cmd(code, cmd)
 
-    elif attempt == 2:
-        # 策略 2: 使用 base64 编码（终极方案）
-        return _encode_with_base64(cmd)
+    if attempt == 2:
+        code = _extract_heredoc(cmd) or _extract_python_c(cmd)
+        if code:
+            return _make_base64_cmd(code, cmd)
 
     return cmd
 
 
-def _contains_python_code(cmd):
-    """检测命令是否包含 Python 代码"""
-    python_indicators = [
-        'python', 'python3',
-        'import ', 'from ',
-        'def ', 'class ',
-        'print(', 'if __name__',
-    ]
-    return any(indicator in cmd for indicator in python_indicators)
+def _extract_python_c(cmd):
+    """Extract code from python -c 'code' format."""
+    match = re.search(r'python3?\s+-c\s+["\'](.+?)["\']', cmd, re.DOTALL)
+    return match.group(1) if match else None
 
 
-def _convert_to_heredoc(cmd):
-    """将 Python 代码转换为 HEREDOC 格式"""
-    # 提取 python 命令和代码
-    if 'python' in cmd and ('-c' in cmd or '<<' not in cmd):
-        # 尝试提取 python -c 'code' 格式
-        match = re.search(r'python3?\s+-c\s+["\'](.+)["\']', cmd, re.DOTALL)
-        if match:
-            python_code = match.group(1)
-            # 去除转义字符
-            python_code = python_code.replace(r'\"', '"').replace(r"\'", "'").replace(r'\\', '\\')
-
-            return f'''python3 <<'PYTHON_EOF'
-{python_code}
-PYTHON_EOF'''
-
-    return cmd
+def _make_tempfile_cmd(code, original_cmd):
+    """Create bash tempfile command."""
+    python_cmd = 'python3' if 'python3' in original_cmd else 'python'
+    return f'''tmpfile=$(mktemp --suffix=.py)
+cat > "$tmpfile" <<'EOF'
+{code}
+EOF
+{python_cmd} "$tmpfile"
+ret=$?
+rm -f "$tmpfile"
+exit $ret
+'''
 
 
-def _escape_special_chars(cmd):
-    """转义 bash 特殊字符（保守策略）"""
-    # 对于包含引号的字符串，尝试使用单引号包裹
-    # 这是一个简化版本，实际情况可能需要更复杂的逻辑
+def _make_base64_cmd(code, original_cmd):
+    """Create base64-encoded command (ultimate fallback)."""
+    python_cmd = 'python3' if 'python3' in original_cmd else 'python'
+    encoded = base64.b64encode(code.encode('utf-8')).decode('ascii')
+    return f"echo '{encoded}' | base64 -d | {python_cmd}"
 
-    # 如果命令包含双引号但不包含单引号，用单引号包裹
-    if '"' in cmd and "'" not in cmd:
-        # 找到 -c 参数后的内容
-        match = re.search(r'(-c\s+)(.+)', cmd, re.DOTALL)
-        if match:
-            prefix = match.group(1)
-            code = match.group(2).strip()
-            # 移除原有的引号
-            code = code.strip('"').strip("'")
-            return cmd[:match.start(1)] + prefix + f"'{code}'"
-
-    return cmd
-
-
-def _encode_with_base64(cmd):
-    """使用 base64 编码避免所有转义问题（终极方案）"""
-    import base64
-
-    # 提取实际要执行的 Python 代码
-    if 'python' in cmd:
-        match = re.search(r'python3?\s+(?:-c\s+)?["\']?(.+?)["\']?$', cmd, re.DOTALL)
-        if match:
-            python_code = match.group(1).strip().strip('"').strip("'")
-
-            # Base64 编码
-            encoded = base64.b64encode(python_code.encode('utf-8')).decode('ascii')
-
-            return f"echo '{encoded}' | base64 -d | python3"
-
-    return cmd
 
 def submit():
     """
