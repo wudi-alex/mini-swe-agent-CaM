@@ -24,50 +24,50 @@ app = typer.Typer(add_completion=False)
 DEFAULT_OUTPUT = global_config_dir / "astropy-13398-mini.traj.json"
 
 
-class InteractiveAgentCam(InteractiveAgent):
-    def parse_action(self, response: dict) -> dict:
-        """Parse the action from the message and construct python -c command."""
-        import re
-
-        # 提取 agent 返回的函数代码
-        function_code = response["content"].strip()
-
-        # 读取本地 tools.py 文件内容
-        # 获取当前脚本所在目录
-        current_dir = Path(__file__).parent
-
-        # 构建 tools.py 路径
-        tools_path = current_dir / 'tools.py'
-        try:
-            with open(tools_path, 'r', encoding='utf-8') as f:
-                tools_code = f.read()
-        except FileNotFoundError:
-            raise FileNotFoundError("tools.py file not found in current directory")
-
-        # 提取所有函数名（从 def function_name(): 中提取）
-        func_name_matches = re.findall(r'def\s+(\w+)\s*\(', function_code)
-
-        # 特殊处理 submit() 情况
-        if function_code == 'submit()':
-            full_code = f"{tools_code}\n\n{function_code}"
-        elif not func_name_matches:
-            raise FormatError(
-                f"Could not extract function name from response. "
-                f"Expected format: def action(): ..."
-            )
-        else:
-            # 拼接完整代码：tools定义 + agent函数定义 + 依次调用所有函数
-            function_calls = '\n'.join([f"{func_name}()" for func_name in func_name_matches])
-            full_code = f"{tools_code}\n\n{function_code}\n\n{function_calls}"
-
-        # 转义代码中的特殊字符用于shell命令
-        # 将单引号替换为 '\'' (结束单引号、转义单引号、开始新单引号)
-        escaped_code = full_code.replace("'", "'\"'\"'")
-
-        # 构造 bash 命令：使用单引号包裹代码避免大部分转义问题
-        action = f"python -c '{escaped_code}'"
-
-        return {"action": action, **response}
+# class InteractiveAgentCam(InteractiveAgent):
+#     def parse_action(self, response: dict) -> dict:
+#         """Parse the action from the message and construct python -c command."""
+#         import re
+#
+#         # 提取 agent 返回的函数代码
+#         function_code = response["content"].strip()
+#
+#         # 读取本地 tools.py 文件内容
+#         # 获取当前脚本所在目录
+#         current_dir = Path(__file__).parent
+#
+#         # 构建 tools.py 路径
+#         tools_path = current_dir / 'tools.py'
+#         try:
+#             with open(tools_path, 'r', encoding='utf-8') as f:
+#                 tools_code = f.read()
+#         except FileNotFoundError:
+#             raise FileNotFoundError("tools.py file not found in current directory")
+#
+#         # 提取所有函数名（从 def function_name(): 中提取）
+#         func_name_matches = re.findall(r'def\s+(\w+)\s*\(', function_code)
+#
+#         # 特殊处理 submit() 情况
+#         if function_code == 'submit()':
+#             full_code = f"{tools_code}\n\n{function_code}"
+#         elif not func_name_matches:
+#             raise FormatError(
+#                 f"Could not extract function name from response. "
+#                 f"Expected format: def action(): ..."
+#             )
+#         else:
+#             # 拼接完整代码：tools定义 + agent函数定义 + 依次调用所有函数
+#             function_calls = '\n'.join([f"{func_name}()" for func_name in func_name_matches])
+#             full_code = f"{tools_code}\n\n{function_code}\n\n{function_calls}"
+#
+#         # 转义代码中的特殊字符用于shell命令
+#         # 将单引号替换为 '\'' (结束单引号、转义单引号、开始新单引号)
+#         escaped_code = full_code.replace("'", "'\"'\"'")
+#
+#         # 构造 bash 命令：使用单引号包裹代码避免大部分转义问题
+#         action = f"python -c '{escaped_code}'"
+#
+#         return {"action": action, **response}
 
 
 # fmt: off
@@ -113,7 +113,7 @@ def main(
     if exit_immediately:
         config.setdefault("agent", {})["confirm_exit"] = False
     env = get_sb_environment(config, instance)
-    agent = InteractiveAgentCam(
+    agent = InteractiveAgent(
         get_model(model_name, config.get("model", {})),
         env,
         **({"mode": "yolo"} | config.get("agent", {})),

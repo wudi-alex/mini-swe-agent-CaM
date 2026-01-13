@@ -17,7 +17,8 @@ class AgentConfig(BaseModel):
     timeout_template: str
     format_error_template: str
     action_observation_template: str
-    action_regex: str = r"```bash\s*\n(.*?)\n```"
+    # action_regex: str = r"```bash\s*\n(.*?)\n```"
+    action_regex: str = r"\s*```bash\s*\n(.*?)\n\s*```"
     step_limit: int = 0
     cost_limit: float = 3.0
 

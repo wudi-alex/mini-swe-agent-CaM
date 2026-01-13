@@ -129,7 +129,7 @@ class DockerEnvironmentCam:
             self.logger.info("pytest not found, installing pytest...")
 
             # Install pytest with fallback for different Python versions
-            install_cmd = f"{python_exe} -m pip install pytest --break-system-packages 2>&1 || {python_exe} -m pip install pytest 2>&1"
+            install_cmd = f"{python_exe} -m pip install pytest 2>&1 || {python_exe} -m pip install pytest 2>&1"
             install_result = self.execute(install_cmd, timeout=120)
 
             if install_result["returncode"] == 0:
