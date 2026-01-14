@@ -1,0 +1,1372 @@
+{
+  "info": {
+    "exit_status": "Submitted",
+    "submission": "diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py\nindex ae82d26340..0c10f5410d 100644\n--- a/django/db/models/deletion.py\n+++ b/django/db/models/deletion.py\n@@ -310,11 +310,30 @@ class Collector:\n                     )\n \n             # fast deletes\n+            # Combine fast delete queries by model/table to reduce DB roundtrips\n+            groups = {}\n             for qs in self.fast_deletes:\n-                count = qs._raw_delete(using=self.using)\n-                deleted_counter[qs.model._meta.label] += count\n+                key = (qs.model._meta.label, qs.model._meta.db_table)\n+                groups.setdefault(key, []).append(qs)\n+            for (label, _), qss in groups.items():\n+                if len(qss) == 1:\n+                    qs = qss[0]\n+                    count = qs._raw_delete(using=self.using)\n+                    deleted_counter[label] += count\n+                    continue\n+                try:\n+                    base_qs = qss[0]._chain()\n+                    # Build a WhereNode combining each queryset's WHERE with OR.\n+                    where_children = [q.query.where for q in qss]\n+                    combined_where = base_qs.query.where_class(where_children, 'OR')\n+                    base_qs.query.where = combined_where\n+                    count = base_qs._raw_delete(using=self.using)\n+                    deleted_counter[label] += count\n+                except Exception:\n+                    for qs in qss:\n+                        count = qs._raw_delete(using=self.using)\n+                        deleted_counter[qs.model._meta.label] += count\n \n-            # update fields\n             for model, instances_for_fieldvalues in self.field_updates.items():\n                 for (field, value), instances in instances_for_fieldvalues.items():\n                     query = sql.UpdateQuery(model)\ndiff --git a/testapp/__init__.py b/testapp/__init__.py\nnew file mode 100644\nindex 0000000000..26c1a343d2\n--- /dev/null\n+++ b/testapp/__init__.py\n@@ -0,0 +1 @@\n+default_app_config='testapp.apps.TestAppConfig'\ndiff --git a/testapp/apps.py b/testapp/apps.py\nnew file mode 100644\nindex 0000000000..ba62d7ac81\n--- /dev/null\n+++ b/testapp/apps.py\n@@ -0,0 +1,4 @@\n+from django.apps import AppConfig\n+class TestAppConfig(AppConfig):\n+    name = 'testapp'\n+    verbose_name = 'Test App'\ndiff --git a/testapp/models.py b/testapp/models.py\nnew file mode 100644\nindex 0000000000..d953f98cfd\n--- /dev/null\n+++ b/testapp/models.py\n@@ -0,0 +1,8 @@\n+from django.db import models\n+class User(models.Model):\n+    pass\n+class Entry(models.Model):\n+    created_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='created_entries')\n+    updated_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='updated_entries')\n+class Person(models.Model):\n+    friends = models.ManyToManyField('self', symmetrical=False, related_name='friends_rel')\n",
+    "model_stats": {
+      "instance_cost": 0.07403684999999999,
+      "api_calls": 13
+    },
+    "mini_version": "1.17.3",
+    "config": {
+      "agent": {
+        "system_template": "You are an ultra token-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usages. Each round of your output is one python code style message formated as follows.\n\n<format_example>\n# <Reasoning Summary>\n@<stage>\ndef <action>_to_<intent>():\n    ```bash\n    cmd\n    ```\n</format_example>\n\nFormat Description:\n0. Comments as concise summary about your reasoning tokens to explain the observation of last action's result and why this action should be taken.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is cmd sequence wrapped by ```bash```.\n\nYour response MUST include EXACTLY ONE bash code block!!!\nFailure to follow these rules will cause your response to be rejected.\n",
+        "instance_template": "<pr_description>\nConsider the following PR description:\n{{task}}\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\n## Important Boundaries\n- MODIFY: Regular source code files in your workspace \\testbed  (this is the working directory for all your subsequent commands); Notice in the start you are all ready under the path \\testbed, you can use \"grep .\".\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n## Environment Details\n- You have a Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n**CRITICAL REQUIREMENTS:**\n- Your response MUST include EXACTLY ONE bash code block\n- This bash block MUST contain EXACTLY ONE command (or a set of commands connected with && or ||)\n- If you include zero or multiple bash blocks, or no command at all, YOUR RESPONSE WILL FAIL\n- Do NOT try to run multiple independent commands in separate blocks in one response\n- Directory or environment variable changes are not persistent. Every action is executed in a new subshell.\n- However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files\n\nBad Message:\n<example_response>\n@bug_localization\ndef grep_stringify_signature():\n    ```bash\n    cd /testbed && grep -nR \"def stringify_signature\" -n sphinx | sed -n '1,200p' || true\n    ```\n\n@bug_localization\ndef show_stringify_signature():\n    ```bash\n    cd /testbed && sed -n '1,240p' sphinx/util/typing.py\n    ```\n</example_response>\n\nCorrected Message:\n<example_response>\n@bug_localization\ndef inspect_stringify_signature():\n    ```bash\n    cd /testbed && grep -nR \"def stringify_signature\" -n sphinx | sed -n '1,200p' || true && sed -n '1,240p' sphinx/util/typing.py\n    ```\n</example_response>\n\nIf you need to run multiple commands, either:\n1. Combine them in one block using && or ||\n```bash\ncommand1 && command2 || echo \"Error occurred\"\n```\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Useful Command Examples When Using CMD TOOL\n\nIf you need to run multiple commands, either:\n1. Combine them in one block using && or ||\n```bash\ncommand1 && command2 || echo \"Error occurred\"\n```\n\n2. Wait for the first command to complete, see its output, then issue the next command in your following response.\n\n## Environment Details\n- You have a full Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n- If a command isn't available, you can install it\n\n## Useful Command Examples\n\n### Create a new file:\n```bash\ncat <<'PY' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nPY\n```\n\n### Run python code \n\n```bash\ncd /testbed && python - <<'PY'\nimport numpy as np\nhello = \"world\"\nprint(hello)\nPY\n```\n\n### Patch and Run Test (Directly combine them into one code block, no need to seperate cmd using &&)\n\n```bash\npython - <<'PY'\n# apply patch\nfrom pathlib import Path\nPath('calculator.py').write_text(\"def add(a, b):\\n    return a + b\\n\")\nprint(\"Applied fix to calculator.py\")\n\n# patch verification\nfrom calculator import add\nresult = add(2, 3)\nassert result == 5, f\"Expected 5, got {result}\"\nprint(f\"Verification passed: 2 + 3 = {result}\")\nPY\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\n### Any other command you want to run\n```bash\nanything\n```\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n\n</instructions>\n",
+        "timeout_template": "The last action timed out and has been killed.\nThe output of the action was:\n{% if output | length < 10000 -%}\n<output>\n{{output}}\n</output>\n{%- else -%}\n<warning>Output was too long and has been truncated.</warning>\n<output_head>\n{{ output[:5000] }}\n</output_head>\n<elided_chars>{{ output | length - 10000 }} characters elided</elided_chars>\n<output_tail>\n{{ output[-5000:] }}\n</output_tail>\n{%- endif %}\nPlease try another command and make sure to avoid those requiring interactive input.\n",
+        "format_error_template": "Please always provide EXACTLY ONE action in triple backticks, found actions.\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).\n",
+        "action_observation_template": "<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n",
+        "action_regex": "\\s*```bash\\s*\\n(.*?)\\n\\s*```",
+        "step_limit": 50,
+        "cost_limit": 1.0
+      },
+      "model": {
+        "model_name": "openai/gpt-5-mini",
+        "model_kwargs": {
+          "reasoning": {
+            "effort": "high"
+          }
+        },
+        "litellm_model_registry": null,
+        "set_cache_control": null,
+        "cost_tracking": "default"
+      },
+      "environment": {
+        "image": "docker.io/swebench/sweb.eval.x86_64.django_1776_django-11885:latest",
+        "cwd": "/testbed",
+        "env": {
+          "LANG": "C.UTF-8",
+          "LC_ALL": "C.UTF-8",
+          "PYTHONIOENCODING": "utf-8",
+          "PAGER": "cat",
+          "MANPAGER": "cat",
+          "LESS": "-R",
+          "PIP_PROGRESS_BAR": "off",
+          "TQDM_DISABLE": "1"
+        },
+        "forward_env": [],
+        "timeout": 60,
+        "executable": "docker",
+        "run_args": [
+          "--rm"
+        ],
+        "container_timeout": "2h",
+        "pull_timeout": 120
+      },
+      "agent_type": "minisweagent.run.extra.swebench_cam.ProgressTrackingAgent",
+      "model_type": "minisweagent.models.litellm_response_api_model.LitellmResponseAPIModel",
+      "environment_type": "minisweagent.environments.docker_cam.DockerEnvironmentCam"
+    }
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an ultra token-efficient Automated Program Repair (APR) Agent. Your goal is to fix bugs via a State-Action-Return loop with minimal token usages. Each round of your output is one python code style message formated as follows.\n\n<format_example>\n# <Reasoning Summary>\n@<stage>\ndef <action>_to_<intent>():\n    ```bash\n    cmd\n    ```\n</format_example>\n\nFormat Description:\n0. Comments as concise summary about your reasoning tokens to explain the observation of last action's result and why this action should be taken.\n1. Stage as decorator representing the stages of APR workflow: @bug_reproduction, @bug_localization, @test_generation, @patch_generation, @patch_verification, @debug\n2. Function name summarizes what you going to do (action) and its intent (for example, generate_and_execute_tests_to_verify_patch). All action information should be expressed by function name.\n3. Function body is cmd sequence wrapped by ```bash```.\n\nYour response MUST include EXACTLY ONE bash code block!!!\nFailure to follow these rules will cause your response to be rejected.",
+      "timestamp": 1768345459.4684713
+    },
+    {
+      "role": "user",
+      "content": "<pr_description>\nConsider the following PR description:\nCombine fast delete queries\nDescription\n\t\nWhen emulating ON DELETE CASCADE via on_delete=models.CASCADE the deletion.Collector will try to perform fast queries which are DELETE FROM table WHERE table.pk IN .... There's a few conditions required for this fast path to be taken but when this happens the collection logic should combine such queries by table to reduce the number of roundtrips to the database.\nFor example, given the following models\nclass Person(models.Model):\n\tfriends = models.ManyToManyField('self')\nclass User(models.Model):\n\tpass\nclass Entry(models.Model):\n\tcreated_by = models.ForeignKey(User)\n\tupdated_by = models.ForeignKey(User)\nIssuing a person.delete() or user.delete() will result in 3 queries of the form\nDELETE FROM person_friends WHERE from_id = :id\nDELETE FROM person_friends WHERE to_id = :id\nDELETE FROM person WHERE id = :id\nDELETE FROM entry WHERE created_by_id = :id\nDELETE FROM entry WHERE updated_by = :id\nDELETRE FROM user WHERE id = :id\nBut both queries (or N queries depending on the number of foreign relationships) can be combined into a single one by using OR\nDELETE FROM person_friends WHERE from_id = :id OR to_id = :id\nDELETE FROM person WHERE id = :id\nDELETE FROM entry WHERE created_by_id = :id OR updated_by = :id\nDELETE FROM user WHERE id = :id\n\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting executable codes to fix bugs.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\n## Important Boundaries\n- MODIFY: Regular source code files in your workspace \\testbed  (this is the working directory for all your subsequent commands); Notice in the start you are all ready under the path \\testbed, you can use \"grep .\".\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the bug issue to directly navigate to the possible bug location by grep commands.\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Generate edge test cases to ensure your fix is robust, make sure generate test script only once with complete thinking. \n6. When finish only need to response with \"submit()\"\n\n## Environment Details\n- You have a Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n\n**CRITICAL REQUIREMENTS:**\n- Your response MUST include EXACTLY ONE bash code block\n- This bash block MUST contain EXACTLY ONE command (or a set of commands connected with && or ||)\n- If you include zero or multiple bash blocks, or no command at all, YOUR RESPONSE WILL FAIL\n- Do NOT try to run multiple independent commands in separate blocks in one response\n- Directory or environment variable changes are not persistent. Every action is executed in a new subshell.\n- However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files\n\nBad Message:\n<example_response>\n@bug_localization\ndef grep_stringify_signature():\n    ```bash\n    cd /testbed && grep -nR \"def stringify_signature\" -n sphinx | sed -n '1,200p' || true\n    ```\n\n@bug_localization\ndef show_stringify_signature():\n    ```bash\n    cd /testbed && sed -n '1,240p' sphinx/util/typing.py\n    ```\n</example_response>\n\nCorrected Message:\n<example_response>\n@bug_localization\ndef inspect_stringify_signature():\n    ```bash\n    cd /testbed && grep -nR \"def stringify_signature\" -n sphinx | sed -n '1,200p' || true && sed -n '1,240p' sphinx/util/typing.py\n    ```\n</example_response>\n\nIf you need to run multiple commands, either:\n1. Combine them in one block using && or ||\n```bash\ncommand1 && command2 || echo \"Error occurred\"\n```\n2. Wait for the first action to complete, see its output, then issue the next action in your following response.\n\n## Useful Command Examples When Using CMD TOOL\n\nIf you need to run multiple commands, either:\n1. Combine them in one block using && or ||\n```bash\ncommand1 && command2 || echo \"Error occurred\"\n```\n\n2. Wait for the first command to complete, see its output, then issue the next command in your following response.\n\n## Environment Details\n- You have a full Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n- If a command isn't available, you can install it\n\n## Useful Command Examples\n\n### Create a new file:\n```bash\ncat <<'PY' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nPY\n```\n\n### Run python code \n\n```bash\ncd /testbed && python - <<'PY'\nimport numpy as np\nhello = \"world\"\nprint(hello)\nPY\n```\n\n### Patch and Run Test (Directly combine them into one code block, no need to seperate cmd using &&)\n\n```bash\npython - <<'PY'\n# apply patch\nfrom pathlib import Path\nPath('calculator.py').write_text(\"def add(a, b):\\n    return a + b\\n\")\nprint(\"Applied fix to calculator.py\")\n\n# patch verification\nfrom calculator import add\nresult = add(2, 3)\nassert result == 5, f\"Expected 5, got {result}\"\nprint(f\"Verification passed: 2 + 3 = {result}\")\nPY\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\n### Any other command you want to run\n```bash\nanything\n```\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following message:\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```\n\nThis message will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n\n</instructions>",
+      "timestamp": 1768345459.468981
+    },
+    {
+      "role": "assistant",
+      "content": "# Locate deletion/collector code paths to find where fast DELETE queries are formed\n@bug_localization\ndef search_delete_collector_and_on_delete_usages():\n    ```bash\n    cd /testbed && grep -nR -e \"Collector\" -e \"on_delete\" -e \"DELETE FROM\" -e \"fast delete\" -e \"ON DELETE CASCADE\" . || true\n    ```",
+      "timestamp": 1768345487.9867232,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmNmNzM3MTU4ODE5N2IzMjlmYzRlNDEwOWIyZTM=",
+          "created_at": 1768345459,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966cf73c2cc819780b75feb6a1d07af",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966cf8e3fb88197af96e9c8e77e510b",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Locate deletion/collector code paths to find where fast DELETE queries are formed\n@bug_localization\ndef search_delete_collector_and_on_delete_usages():\n    ```bash\n    cd /testbed && grep -nR -e \"Collector\" -e \"on_delete\" -e \"DELETE FROM\" -e \"fast delete\" -e \"ON DELETE CASCADE\" . || true\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": null,
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 1772,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 0,
+              "text_tokens": null
+            },
+            "output_tokens": 1433,
+            "output_tokens_details": {
+              "reasoning_tokens": 1344,
+              "text_tokens": null
+            },
+            "total_tokens": 3205,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345487,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning><output_head>\ngrep: ./.git/objects/pack/pack-e25447987484e6dd9eaa74dbddef2c95068bf217.pack: binary file matches\n./django/core/cache/backends/db.py:220:                'DELETE FROM %s WHERE %s IN (%s)' % (\n./django/core/cache/backends/db.py:259:            cursor.execute(\"DELETE FROM %s WHERE expires < %%s\" % table,\n./django/core/cache/backends/db.py:268:                cursor.execute(\"DELETE FROM %s \"\n./django/core/cache/backends/db.py:277:            cursor.execute('DELETE FROM %s' % table)\n./django/core/management/commands/inspectdb.py:51:            yield \"#   * Make sure each ForeignKey and OneToOneField has `on_delete` set to the desired behavior\"\n./django/contrib/redirects/migrations/0001_initial.py:18:                    on_delete=models.CASCADE,\n./django/contrib/auth/migrations/0001_initial.py:21:                    on_delete=models.CASCADE,\n./django/contrib/gis/db/backends/oracle/schema.py:21:    sql_clear_geometry_table_metadata = 'DELETE FROM USER_SDO_GEOM_METADATA WHERE TABLE_NAME = %(table)s'\n./django/contrib/gis/db/backends/oracle/schema.py:23:        'DELETE FROM USER_SDO_GEOM_METADATA WHERE TABLE_NAME = %(table)s '\n./django/contrib/gis/db/backends/spatialite/schema.py:17:    sql_discard_geometry_columns = \"DELETE FROM %(geom_table)s WHERE f_table_name = %(table)s\"\n./django/contrib/contenttypes/fields.py:270:            limit_choices_to=limit_choices_to, on_delete=DO_NOTHING,\n./django/contrib/contenttypes/fields.py:300:        kwargs['on_delete'] = models.CASCADE\n./django/contrib/contenttypes/management/commands/remove_stale_contenttypes.py:5:from django.db.models.deletion import Collector\n./django/contrib/contenttypes/management/commands/remove_stale_contenttypes.py:40:                        collector = NoFastDeleteCollector(using=using)\n./django/contrib/contenttypes/management/commands/remove_stale_contenttypes.py:75:class NoFastDeleteCollector(Collector):\n./django/contrib/admin/widgets.py:253:        cascade = getattr(rel, 'on_delete', None) is CASCADE\n./django/contrib/admin/migrations/0001_initial.py:25:                    on_delete=models.SET_NULL,\n./django/contrib/admin/migrations/0001_initial.py:32:                    on_delete=models.CASCADE,\n./django/contrib/admin/utils.py:9:from django.db.models.deletion import Collector\n./django/contrib/admin/utils.py:159:class NestedObjects(Collector):\n./django/db/models/fields/related.py:460:    def __init__(self, to, on_delete, from_fields, to_fields, rel=None, related_name=None,\n./django/db/models/fields/related.py:471:                on_delete=on_delete,\n./django/db/models/fields/related.py:567:        kwargs['on_delete'] = self.remote_field.on_delete\n./django/db/models/fields/related.py:782:    def __init__(self, to, on_delete, related_name=None, related_query_name=None,\n./django/db/models/fields/related.py:800:        if not callable(on_delete):\n./django/db/models/fields/related.py:801:            raise TypeError('on_delete must be callable.')\n./django/db/models/fields/related.py:809:            on_delete=on_delete,\n./django/db/models/fields/related.py:813:        super().__init__(to, on_delete, from_fields=['self'], to_fields=[to_field], **kwargs)\n./django/db/models/fields/related.py:820:            *self._check_on_delete(),\n./django/db/models/fields/related.py:824:    def _check_on_delete(self):\n./django/db/models/fields/related.py:825:        on_delete = getattr(self.remote_field, 'on_delete', None)\n./django/db/models/fields/related.py:826:        if on_delete == SET_NULL and not self.null:\n./django/db/models/fields/related.py:829:                    'Field specifies on_delete=SET_NULL, but cannot be null.',\n./django/db/models/fields/related.py:830:                    hint='Set null=True argument on the field, or change the on_delete rule.',\n./django/db/models/fields/related.py:835:        elif on_delete == SET_DEFAULT and not self.has_default():\n./django/db/models/fields/related.py:838:                    'Field specifies on_delete=SET_DEFAULT, but has no default value.',\n./django/db/models/fields/related.py:839:                    hint='Set a default value, or change the on_delete rule.',\n./django/db/models/fields/related.py:1014:    def __init__(self, to, on_delete, to_field=None, **kwargs):\n./django/db/models/fields/related.py:1016:        super().__init__(to, on_delete, to_field=to_field, **kwargs)\n./django/db/models/fields/related.py:1079:            on_delete=CASCADE,\n./django/db/models/fields/related.py:1086:            on_delete=CASCADE,\n./django/db/models/fields/reverse_related.py:38:                 limit_choices_to=None, parent_link=False, on_delete=None):\n./django/db/models/fields/reverse_related.py:45:        self.on_delete = on_delete\n./django/db/models/fields/reverse_related.py:196:                 limit_choices_to=None, parent_link=False, on_delete=None):\n./django/db/models/fields/reverse_related.py:203:            on_delete=on_delete,\n./django/db/models/fields/reverse_related.py:235:                 limit_choices_to=None, parent_link\n</output_head>\n<elided_chars>\n21030 characters elided\n</elided_chars>\n<output_tail>\n on_delete=models.CASCADE, related_name=\"from_friends\")\n./docs/ref/contrib/admin/index.txt:2555:        person = models.ForeignKey(Person, on_delete=models.CASCADE)\n./docs/ref/contrib/admin/index.txt:2556:        group = models.ForeignKey(Group, on_delete=models.CASCADE)\n./docs/ref/contrib/admin/index.txt:2600:        content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)\n./docs/topics/class-based-views/generic-display.txt:104:        publisher = models.ForeignKey(Publisher, on_delete=models.CASCADE)\n./docs/topics/class-based-views/generic-editing.txt:198:        created_by = models.ForeignKey(User, on_delete=models.CASCADE)\n./docs/topics/auth/customizing.txt:321:        user = models.OneToOneField(User, on_delete=models.CASCADE)\n./docs/topics/auth/customizing.txt:475:                on_delete=models.CASCADE,\n./docs/topics/i18n/translation.txt:376:            on_delete=models.CASCADE,\n./docs/topics/i18n/translation.txt:416:            on_delete=models.CASCADE,\n./docs/topics/forms/modelforms.txt:1144:        author = models.ForeignKey(Author, on_delete=models.CASCADE)\n./docs/topics/forms/modelforms.txt:1209:            on_delete=models.CASCADE,\n./docs/topics/forms/modelforms.txt:1214:            on_delete=models.CASCADE,\n./docs/topics/conditional-view-processing.txt:83:        blog = models.ForeignKey(Blog, on_delete=models.CASCADE)\n./docs/topics/db/aggregation.txt:36:        publisher = models.ForeignKey(Publisher, on_delete=models.CASCADE)\n./docs/topics/db/models.txt:102:        artist = models.ForeignKey(Musician, on_delete=models.CASCADE)\n./docs/topics/db/models.txt:303:        on_delete=models.CASCADE,\n./docs/topics/db/models.txt:309:        on_delete=models.CASCADE,\n./docs/topics/db/models.txt:345:        manufacturer = models.ForeignKey(Manufacturer, on_delete=models.CASCADE)\n./docs/topics/db/models.txt:361:            on_delete=models.CASCADE,\n./docs/topics/db/models.txt:475:        person = models.ForeignKey(Person, on_delete=models.CASCADE)\n./docs/topics/db/models.txt:476:        group = models.ForeignKey(Group, on_delete=models.CASCADE)\n./docs/topics/db/models.txt:652:            on_delete=models.SET_NULL,\n./docs/topics/db/models.txt:853:    delete <django.db.models.ForeignKey.on_delete>`. To ensure customized\n./docs/topics/db/models.txt:1093:        Place, on_delete=models.CASCADE,\n./docs/topics/db/models.txt:1370:        article_piece = models.OneToOneField(Piece, on_delete=models.CASCADE, parent_link=True)\n./docs/topics/db/models.txt:1374:        book_piece = models.OneToOneField(Piece, on_delete=models.CASCADE, parent_link=True)\n./docs/topics/db/queries.txt:37:        blog = models.ForeignKey(Blog, on_delete=models.CASCADE)\n./docs/topics/db/queries.txt:929:constraint ``ON DELETE CASCADE`` -- in other words, any objects which had\n./docs/topics/db/queries.txt:938::attr:`~django.db.models.ForeignKey.on_delete` argument to the\n./docs/topics/db/queries.txt:1163:model was altered to ``blog = ForeignKey(Blog, on_delete=models.CASCADE,\n./docs/topics/db/queries.txt:1293:        entry = models.OneToOneField(Entry, on_delete=models.CASCADE)\n./docs/topics/db/managers.txt:90:        poll = models.ForeignKey(OpinionPoll, on_delete=models.CASCADE)\n./docs/topics/db/examples/one_to_one.txt:22:            on_delete=models.CASCADE,\n./docs/topics/db/examples/one_to_one.txt:32:        restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE)\n./docs/topics/db/examples/many_to_one.txt:20:        reporter = models.ForeignKey(Reporter, on_delete=models.CASCADE)\n./docs/topics/db/examples/many_to_one.txt:189:ForeignKey was defined with :attr:`django.db.models.ForeignKey.on_delete` set to\n./docs/topics/serialization.txt:374:        author = models.ForeignKey(Person, on_delete=models.CASCADE)\n./docs/topics/serialization.txt:591:        author = models.ForeignKey(Person, on_delete=models.CASCADE)\n./docs/releases/1.8.7.txt:54:  ``on_delete=models.SET_NULL`` (:ticket:`25715`).\n./docs/releases/1.9.txt:1194:``ForeignKey`` and ``OneToOneField`` ``on_delete`` argument\n./docs/releases/1.9.txt:1198:``on_delete`` argument of ``ForeignKey`` and ``OneToOneField`` will be required\n./docs/releases/1.9.txt:1202:default is ``models.CASCADE``, add ``on_delete=models.CASCADE`` to all\n./docs/releases/1.3.txt:152::attr:`~django.db.models.ForeignKey.on_delete` argument to customize behavior\n./docs/releases/1.3.txt:157:For more information, see the :attr:`~django.db.models.ForeignKey.on_delete`\n./docs/releases/2.0.txt:709:* The ``on_delete`` argument for ``ForeignKey`` and ``OneToOneField`` is now\n./docs/internals/deprecation.txt:180:* The ``on_delete`` argument for ``ForeignKey`` and ``OneToOneField``  will be\n./docs/intro/overview.txt:43:        reporter = models.ForeignKey(Reporter, on_delete=models.CASCADE)\n./docs/intro/overview.txt:159:        reporter = models.ForeignKey(Reporter, on_delete=models.CASCADE)\n./docs/intro/tutorial02.txt:150:        question = models.ForeignKey(Question, on_delete=models.CASCADE)\n\n</output_tail>",
+      "timestamp": 1768345489.769743
+    },
+    {
+      "role": "assistant",
+      "content": "# Inspect Collector implementation to find where fast DELETE queries are built/issued\n@bug_localization\ndef inspect_collector_for_fast_deletes():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/db/models/deletion.py\n    ```",
+      "timestamp": 1768345509.7188547,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmNmOTFjNmZjODE5Nzk4Nzk0NGMyMDNjMWUwOTg=",
+          "created_at": 1768345490,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966cf926de48197adb874c9b1cb0fe6",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966cfa2188481978ff297ec1520ccd7",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Inspect Collector implementation to find where fast DELETE queries are built/issued\n@bug_localization\ndef inspect_collector_for_fast_deletes():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/db/models/deletion.py\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966cf7371588197b329fc4e4109b2e3",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 4446,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 0,
+              "text_tokens": null
+            },
+            "output_tokens": 959,
+            "output_tokens_details": {
+              "reasoning_tokens": 896,
+              "text_tokens": null
+            },
+            "total_tokens": 5405,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345509,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning><output_head>\nfrom collections import Counter\nfrom itertools import chain\nfrom operator import attrgetter\n\nfrom django.db import IntegrityError, connections, transaction\nfrom django.db.models import signals, sql\n\n\nclass ProtectedError(IntegrityError):\n    def __init__(self, msg, protected_objects):\n        self.protected_objects = protected_objects\n        super().__init__(msg, protected_objects)\n\n\ndef CASCADE(collector, field, sub_objs, using):\n    collector.collect(sub_objs, source=field.remote_field.model,\n                      source_attr=field.name, nullable=field.null)\n    if field.null and not connections[using].features.can_defer_constraint_checks:\n        collector.add_field_update(field, None, sub_objs)\n\n\ndef PROTECT(collector, field, sub_objs, using):\n    raise ProtectedError(\n        \"Cannot delete some instances of model '%s' because they are \"\n        \"referenced through a protected foreign key: '%s.%s'\" % (\n            field.remote_field.model.__name__, sub_objs[0].__class__.__name__, field.name\n        ),\n        sub_objs\n    )\n\n\ndef SET(value):\n    if callable(value):\n        def set_on_delete(collector, field, sub_objs, using):\n            collector.add_field_update(field, value(), sub_objs)\n    else:\n        def set_on_delete(collector, field, sub_objs, using):\n            collector.add_field_update(field, value, sub_objs)\n    set_on_delete.deconstruct = lambda: ('django.db.models.SET', (value,), {})\n    return set_on_delete\n\n\ndef SET_NULL(collector, field, sub_objs, using):\n    collector.add_field_update(field, None, sub_objs)\n\n\ndef SET_DEFAULT(collector, field, sub_objs, using):\n    collector.add_field_update(field, field.get_default(), sub_objs)\n\n\ndef DO_NOTHING(collector, field, sub_objs, using):\n    pass\n\n\ndef get_candidate_relations_to_delete(opts):\n    # The candidate relations are the ones that come from N-1 and 1-1 relations.\n    # N-N  (i.e., many-to-many) relations aren't candidates for deletion.\n    return (\n        f for f in opts.get_fields(include_hidden=True)\n        if f.auto_created and not f.concrete and (f.one_to_one or f.one_to_many)\n    )\n\n\nclass Collector:\n    def __init__(self, using):\n        self.using = using\n        # Initially, {model: {instances}}, later values become lists.\n        self.data = {}\n        self.field_updates = {}  # {model: {(field, value): {instances}}}\n        # fast_deletes is a list of queryset-likes that can be deleted without\n        # fetching the objects into memory.\n        self.fast_deletes = []\n\n        # Tracks deletion-order dependency for databases without transactions\n        # or ability to defer constraint checks. Only concrete model classes\n        # should be included, as the dependencies exist only between actual\n        # database tables; proxy models are represented here by their concrete\n        # parent.\n        self.dependencies = {}  # {model: {models}}\n\n    def add(self, objs, source=None, nullable=False, reverse_dependency=False):\n        \"\"\"\n        Add 'objs' to the collection of objects to be deleted.  If the call is\n        the result of a cascade, 'source' should be the model that caused it,\n        and 'nullable' should be set to True if the relation can be null.\n\n        Return a list of all objects that were not already collected.\n        \"\"\"\n        if not objs:\n            return []\n        new_objs = []\n        model = objs[0].__class__\n        instances = self.data.setdefault(model, set())\n        for obj in objs:\n            if obj not in instances:\n                new_objs.append(obj)\n        instances.update(new_objs)\n        # Nullable relationships can be ignored -- they are nulled out before\n        # deleting, and therefore do not affect the order in which objects have\n        # to be deleted.\n        if source is not None and not nullable:\n            if reverse_dependency:\n                source, model = model, source\n            self.dependencies.setdefault(\n                source._meta.concrete_model, set()).add(model._meta.concrete_model)\n        return new_objs\n\n    def add_field_update(self, field, value, objs):\n        \"\"\"\n        Schedule a field update. 'objs' must be a homogeneous iterable\n        collection of model instances (e.g. a QuerySet).\n        \"\"\"\n        if not objs:\n            return\n        model = objs[0].__class__\n        self.field_updates.setdefault(\n            model, {}).setdefault(\n            (field, value), set()).update(objs)\n\n    def _has_signal_listeners(self, model):\n        return (\n            signals.pre_delete.has_listeners(model) or\n            signals.post_delete.has_listeners(model)\n        )\n\n    def can_fast_delete(self, objs, from_field=None):\n        \"\"\"\n        Determine if the objects in the given queryset-like or single object\n        can be fast-deleted. This can be done if there are no cascades, no\n        parents and no signal listeners for the object class.\n\n        The 'from_field' tells where we are coming from - we need this to\n        determine if the \n</output_head>\n<elided_chars>\n332 characters elided\n</elided_chars>\n<output_tail>\nhasattr(objs, 'model') and hasattr(objs, '_raw_delete'):\n            model = objs.model\n        else:\n            return False\n        if self._has_signal_listeners(model):\n            return False\n        # The use of from_field comes from the need to avoid cascade back to\n        # parent when parent delete is cascading to child.\n        opts = model._meta\n        return (\n            all(link == from_field for link in opts.concrete_model._meta.parents.values()) and\n            # Foreign keys pointing to this model.\n            all(\n                related.field.remote_field.on_delete is DO_NOTHING\n                for related in get_candidate_relations_to_delete(opts)\n            ) and (\n                # Something like generic foreign key.\n                not any(hasattr(field, 'bulk_related_objects') for field in opts.private_fields)\n            )\n        )\n\n    def get_del_batches(self, objs, field):\n        \"\"\"\n        Return the objs in suitably sized batches for the used connection.\n        \"\"\"\n        conn_batch_size = max(\n            connections[self.using].ops.bulk_batch_size([field.name], objs), 1)\n        if len(objs) > conn_batch_size:\n            return [objs[i:i + conn_batch_size]\n                    for i in range(0, len(objs), conn_batch_size)]\n        else:\n            return [objs]\n\n    def collect(self, objs, source=None, nullable=False, collect_related=True,\n                source_attr=None, reverse_dependency=False, keep_parents=False):\n        \"\"\"\n        Add 'objs' to the collection of objects to be deleted as well as all\n        parent instances.  'objs' must be a homogeneous iterable collection of\n        model instances (e.g. a QuerySet).  If 'collect_related' is True,\n        related objects will be handled by their respective on_delete handler.\n\n        If the call is the result of a cascade, 'source' should be the model\n        that caused it and 'nullable' should be set to True, if the relation\n        can be null.\n\n        If 'reverse_dependency' is True, 'source' will be deleted before the\n        current model, rather than after. (Needed for cascading to parent\n        models, the one case in which the cascade follows the forwards\n        direction of an FK rather than the reverse direction.)\n\n        If 'keep_parents' is True, data of parent model's will be not deleted.\n        \"\"\"\n        if self.can_fast_delete(objs):\n            self.fast_deletes.append(objs)\n            return\n        new_objs = self.add(objs, source, nullable,\n                            reverse_dependency=reverse_dependency)\n        if not new_objs:\n            return\n\n        model = new_objs[0].__class__\n\n        if not keep_parents:\n            # Recursively collect concrete model's parent models, but not their\n            # related objects. These will be found by meta.get_fields()\n            concrete_model = model._meta.concrete_model\n            for ptr in concrete_model._meta.parents.values():\n                if ptr:\n                    parent_objs = [getattr(obj, ptr.name) for obj in new_objs]\n                    self.collect(parent_objs, source=model,\n                                 source_attr=ptr.remote_field.related_name,\n                                 collect_related=False,\n                                 reverse_dependency=True)\n        if collect_related:\n            if keep_parents:\n                parents = set(model._meta.get_parent_list())\n            for related in get_candidate_relations_to_delete(model._meta):\n                # Preserve parent reverse relationships if keep_parents=True.\n                if keep_parents and related.model in parents:\n                    continue\n                field = related.field\n                if field.remote_field.on_delete == DO_NOTHING:\n                    continue\n                batches = self.get_del_batches(new_objs, field)\n                for batch in batches:\n                    sub_objs = self.related_objects(related, batch)\n                    if self.can_fast_delete(sub_objs, from_field=field):\n                        self.fast_deletes.append(sub_objs)\n                    else:\n                        related_model = related.related_model\n                        # Non-referenced fields can be deferred if no signal\n                        # receivers are connected for the related model as\n                        # they'll never be exposed to the user. Skip field\n                        # deferring when some relationships are select_related\n                        # as interactions between both features are hard to\n                        # get right. This should only happen in the rare\n                        # cases where .related_objects is overridden anyway.\n                        if not (sub_objs.query.select_related or self._has_signal_listeners(related_model)):\n                            referenced_fields = set(chain.from_iterable(\n                                (rf.attname for rf in rel.field.foreign_related_fields)\n\n</output_tail>",
+      "timestamp": 1768345509.892079
+    },
+    {
+      "role": "assistant",
+      "content": "# Inspect rest of Collector to find where fast_deletes are executed so we can modify combining logic\n@bug_localization\ndef show_fast_delete_execution_in_deletion_py():\n    ```bash\n    cd /testbed && sed -n '240,520p' django/db/models/deletion.py\n    ```",
+      "timestamp": 1768345523.2662525,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmNmYTVlMTQ0ODE5Nzg0MjY2NjRmYmMxYTFjNjM=",
+          "created_at": 1768345510,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966cfa66af88197a9cf8c1a5dd21399",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966cfb173188197a49c7497c2d9a5a8",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Inspect rest of Collector to find where fast_deletes are executed so we can modify combining logic\n@bug_localization\ndef show_fast_delete_execution_in_deletion_py():\n    ```bash\n    cd /testbed && sed -n '240,520p' django/db/models/deletion.py\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966cf91c6fc8197987944c203c1e098",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 6665,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 3840,
+              "text_tokens": null
+            },
+            "output_tokens": 389,
+            "output_tokens_details": {
+              "reasoning_tokens": 320,
+              "text_tokens": null
+            },
+            "total_tokens": 7054,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345522,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n                                (rf.attname for rf in rel.field.foreign_related_fields)\n                                for rel in get_candidate_relations_to_delete(related_model._meta)\n                            ))\n                            sub_objs = sub_objs.only(*tuple(referenced_fields))\n                        if sub_objs:\n                            field.remote_field.on_delete(self, field, sub_objs, self.using)\n            for field in model._meta.private_fields:\n                if hasattr(field, 'bulk_related_objects'):\n                    # It's something like generic foreign key.\n                    sub_objs = field.bulk_related_objects(new_objs, self.using)\n                    self.collect(sub_objs, source=model, nullable=True)\n\n    def related_objects(self, related, objs):\n        \"\"\"\n        Get a QuerySet of objects related to `objs` via the relation `related`.\n        \"\"\"\n        return related.related_model._base_manager.using(self.using).filter(\n            **{\"%s__in\" % related.field.name: objs}\n        )\n\n    def instances_with_model(self):\n        for model, instances in self.data.items():\n            for obj in instances:\n                yield model, obj\n\n    def sort(self):\n        sorted_models = []\n        concrete_models = set()\n        models = list(self.data)\n        while len(sorted_models) < len(models):\n            found = False\n            for model in models:\n                if model in sorted_models:\n                    continue\n                dependencies = self.dependencies.get(model._meta.concrete_model)\n                if not (dependencies and dependencies.difference(concrete_models)):\n                    sorted_models.append(model)\n                    concrete_models.add(model._meta.concrete_model)\n                    found = True\n            if not found:\n                return\n        self.data = {model: self.data[model] for model in sorted_models}\n\n    def delete(self):\n        # sort instance collections\n        for model, instances in self.data.items():\n            self.data[model] = sorted(instances, key=attrgetter(\"pk\"))\n\n        # if possible, bring the models in an order suitable for databases that\n        # don't support transactions or cannot defer constraint checks until the\n        # end of a transaction.\n        self.sort()\n        # number of objects deleted for each model label\n        deleted_counter = Counter()\n\n        # Optimize for the case with a single obj and no dependencies\n        if len(self.data) == 1 and len(instances) == 1:\n            instance = list(instances)[0]\n            if self.can_fast_delete(instance):\n                with transaction.mark_for_rollback_on_error():\n                    count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)\n                setattr(instance, model._meta.pk.attname, None)\n                return count, {model._meta.label: count}\n\n        with transaction.atomic(using=self.using, savepoint=False):\n            # send pre_delete signals\n            for model, obj in self.instances_with_model():\n                if not model._meta.auto_created:\n                    signals.pre_delete.send(\n                        sender=model, instance=obj, using=self.using\n                    )\n\n            # fast deletes\n            for qs in self.fast_deletes:\n                count = qs._raw_delete(using=self.using)\n                deleted_counter[qs.model._meta.label] += count\n\n            # update fields\n            for model, instances_for_fieldvalues in self.field_updates.items():\n                for (field, value), instances in instances_for_fieldvalues.items():\n                    query = sql.UpdateQuery(model)\n                    query.update_batch([obj.pk for obj in instances],\n                                       {field.name: value}, self.using)\n\n            # reverse instance collections\n            for instances in self.data.values():\n                instances.reverse()\n\n            # delete instances\n            for model, instances in self.data.items():\n                query = sql.DeleteQuery(model)\n                pk_list = [obj.pk for obj in instances]\n                count = query.delete_batch(pk_list, self.using)\n                deleted_counter[model._meta.label] += count\n\n                if not model._meta.auto_created:\n                    for obj in instances:\n                        signals.post_delete.send(\n                            sender=model, instance=obj, using=self.using\n                        )\n\n        # update collected instances\n        for instances_for_fieldvalues in self.field_updates.values():\n            for (field, value), instances in instances_for_fieldvalues.items():\n                for obj in instances:\n                    setattr(obj, field.attname, value)\n        for model, instances in self.data.items():\n            for instance in instances:\n                setattr(instance, model._meta.pk.attname, None)\n        return sum(deleted_counter.values()), dict(deleted_counter)\n</output>",
+      "timestamp": 1768345523.410557
+    },
+    {
+      "role": "assistant",
+      "content": "# Find QuerySet._raw_delete implementation to understand how fast deletes are executed\n@bug_localization\ndef find_raw_delete_in_repo():\n    ```bash\n    cd /testbed && grep -nR \"def _raw_delete\" django | sed -n '1,120p' || true\n    ```",
+      "timestamp": 1768345541.6002834,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmNmYjM2MDk0ODE5N2FlMDJiNzQ1NDRiMjBkMTk=",
+          "created_at": 1768345523,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966cfb53a148197af8a0435f28e6d01",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966cfc402308197ad17b8bf96367e2d",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Find QuerySet._raw_delete implementation to understand how fast deletes are executed\n@bug_localization\ndef find_raw_delete_in_repo():\n    ```bash\n    cd /testbed && grep -nR \"def _raw_delete\" django | sed -n '1,120p' || true\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966cfa5e14481978426664fbc1a1c63",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 7665,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 6016,
+              "text_tokens": null
+            },
+            "output_tokens": 1030,
+            "output_tokens_details": {
+              "reasoning_tokens": 960,
+              "text_tokens": null
+            },
+            "total_tokens": 8695,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345541,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\ndjango/db/models/query.py:728:    def _raw_delete(self, using):\n</output>",
+      "timestamp": 1768345541.7785132
+    },
+    {
+      "role": "assistant",
+      "content": "# Show the _raw_delete implementation to see how fast-deletes are executed\n@bug_localization\ndef show_raw_delete_in_query():\n    ```bash\n    cd /testbed && sed -n '680,820p' django/db/models/query.py\n    ```",
+      "timestamp": 1768345562.7628183,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmNmYzViZjVjODE5N2I1YTEyOTg4NjcxM2FjNjQ=",
+          "created_at": 1768345542,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966cfc7608c8197bdec5295f566057f",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966cfd9802881979b8d36068b297e7c",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Show the _raw_delete implementation to see how fast-deletes are executed\n@bug_localization\ndef show_raw_delete_in_query():\n    ```bash\n    cd /testbed && sed -n '680,820p' django/db/models/query.py\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966cfb360948197ae02b74544b20d19",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 7771,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 7040,
+              "text_tokens": null
+            },
+            "output_tokens": 1213,
+            "output_tokens_details": {
+              "reasoning_tokens": 1152,
+              "text_tokens": null
+            },
+            "total_tokens": 8984,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345562,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n                return {}\n            filter_key = '{}__in'.format(field_name)\n            batch_size = connections[self.db].features.max_query_params\n            id_list = tuple(id_list)\n            # If the database has a limit on the number of query parameters\n            # (e.g. SQLite), retrieve objects in batches if necessary.\n            if batch_size and batch_size < len(id_list):\n                qs = ()\n                for offset in range(0, len(id_list), batch_size):\n                    batch = id_list[offset:offset + batch_size]\n                    qs += tuple(self.filter(**{filter_key: batch}).order_by())\n            else:\n                qs = self.filter(**{filter_key: id_list}).order_by()\n        else:\n            qs = self._chain()\n        return {getattr(obj, field_name): obj for obj in qs}\n\n    def delete(self):\n        \"\"\"Delete the records in the current QuerySet.\"\"\"\n        assert not self.query.is_sliced, \\\n            \"Cannot use 'limit' or 'offset' with delete.\"\n\n        if self._fields is not None:\n            raise TypeError(\"Cannot call delete() after .values() or .values_list()\")\n\n        del_query = self._chain()\n\n        # The delete is actually 2 queries - one to find related objects,\n        # and one to delete. Make sure that the discovery of related\n        # objects is performed on the same database as the deletion.\n        del_query._for_write = True\n\n        # Disable non-supported fields.\n        del_query.query.select_for_update = False\n        del_query.query.select_related = False\n        del_query.query.clear_ordering(force_empty=True)\n\n        collector = Collector(using=del_query.db)\n        collector.collect(del_query)\n        deleted, _rows_count = collector.delete()\n\n        # Clear the result cache, in case this QuerySet gets reused.\n        self._result_cache = None\n        return deleted, _rows_count\n\n    delete.alters_data = True\n    delete.queryset_only = True\n\n    def _raw_delete(self, using):\n        \"\"\"\n        Delete objects found from the given queryset in single direct SQL\n        query. No signals are sent and there is no protection for cascades.\n        \"\"\"\n        return sql.DeleteQuery(self.model).delete_qs(self, using)\n    _raw_delete.alters_data = True\n\n    def update(self, **kwargs):\n        \"\"\"\n        Update all elements in the current QuerySet, setting all the given\n        fields to the appropriate values.\n        \"\"\"\n        assert not self.query.is_sliced, \\\n            \"Cannot update a query once a slice has been taken.\"\n        self._for_write = True\n        query = self.query.chain(sql.UpdateQuery)\n        query.add_update_values(kwargs)\n        # Clear any annotations so that they won't be present in subqueries.\n        query.annotations = {}\n        with transaction.mark_for_rollback_on_error(using=self.db):\n            rows = query.get_compiler(self.db).execute_sql(CURSOR)\n        self._result_cache = None\n        return rows\n    update.alters_data = True\n\n    def _update(self, values):\n        \"\"\"\n        A version of update() that accepts field objects instead of field names.\n        Used primarily for model saving and not intended for use by general\n        code (it requires too much poking around at model internals to be\n        useful at that level).\n        \"\"\"\n        assert not self.query.is_sliced, \\\n            \"Cannot update a query once a slice has been taken.\"\n        query = self.query.chain(sql.UpdateQuery)\n        query.add_update_fields(values)\n        # Clear any annotations so that they won't be present in subqueries.\n        query.annotations = {}\n        self._result_cache = None\n        return query.get_compiler(self.db).execute_sql(CURSOR)\n    _update.alters_data = True\n    _update.queryset_only = False\n\n    def exists(self):\n        if self._result_cache is None:\n            return self.query.has_results(using=self.db)\n        return bool(self._result_cache)\n\n    def _prefetch_related_objects(self):\n        # This method can only be called once the result cache has been filled.\n        prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)\n        self._prefetch_done = True\n\n    def explain(self, *, format=None, **options):\n        return self.query.explain(using=self.db, format=format, **options)\n\n    ##################################################\n    # PUBLIC METHODS THAT RETURN A QUERYSET SUBCLASS #\n    ##################################################\n\n    def raw(self, raw_query, params=None, translations=None, using=None):\n        if using is None:\n            using = self.db\n        qs = RawQuerySet(raw_query, model=self.model, params=params, translations=translations, using=using)\n        qs._prefetch_related_lookups = self._prefetch_related_lookups[:]\n        return qs\n\n    def _values(self, *fields, **expressions):\n        clone = self._chain()\n        if expressions:\n            clone = clone.annotate(**expressions)\n        clone._fields = fields\n        clone.query.set_values(fields)\n        return clone\n\n    def values(self, *fields, **expressions):\n        fields += tuple(expressions)\n        clone = self._values(*fields, **expressions)\n        clone._iterable_class = ValuesIterable\n        return clone\n\n    def values_list(self, *fields, flat=False, named=False):\n        if flat and named:\n            raise TypeError(\"'flat' and 'named' can't be used together.\")\n        if flat and len(fields) > 1:\n            raise TypeError(\"'flat' is not valid when values_list is called with more than one field.\")\n\n        field_names = {f for f in fields if not hasattr(f, 'resolve_expression')}\n        _fields = []\n        expressions = {}\n        counter = 1\n        for field in fields:\n</output>",
+      "timestamp": 1768345562.9292734
+    },
+    {
+      "role": "assistant",
+      "content": "# Find DeleteQuery implementation to see how delete_qs/delete_batch are built so we can combine fast_deletes\n@bug_localization\ndef inspect_deletequery_impl():\n    ```bash\n    cd /testbed && grep -nR \"class DeleteQuery\" django | sed -n '1,200p' || true\n    ```",
+      "timestamp": 1768345573.688717,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmNmZGFlYWY0ODE5N2I0ZTM3ZjlkYTBmNDJlYmE=",
+          "created_at": 1768345563,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966cfdb87d88197a4c9f7fe6b2f2208",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966cfdf40948197a9d7224a5a7d5c32",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966cfe40de481978173a77bdaaebf34",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Find DeleteQuery implementation to see how delete_qs/delete_batch are built so we can combine fast_deletes\n@bug_localization\ndef inspect_deletequery_impl():\n    ```bash\n    cd /testbed && grep -nR \"class DeleteQuery\" django | sed -n '1,200p' || true\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966cfc5bf5c8197b5a129886713ac64",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 9057,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 7040,
+              "text_tokens": null
+            },
+            "output_tokens": 523,
+            "output_tokens_details": {
+              "reasoning_tokens": 448,
+              "text_tokens": null
+            },
+            "total_tokens": 9580,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345573,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\ndjango/db/models/sql/subqueries.py:16:class DeleteQuery(Query):\n</output>",
+      "timestamp": 1768345573.8814723
+    },
+    {
+      "role": "assistant",
+      "content": "# Show DeleteQuery implementation to find how delete_qs and delete_batch build SQL so we can combine fast_deletes\n@bug_localization\ndef show_deletequery_subqueries():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/db/models/sql/subqueries.py\n    ```",
+      "timestamp": 1768345605.6155543,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmNmZTVkOGY0ODE5NzgyMzZkMjgzZmIxYTgzZWY=",
+          "created_at": 1768345574,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966cfe6d2cc81979ec2b4b1c5945ab3",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966d0028ae88197bb655a61e8230cc5",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Show DeleteQuery implementation to find how delete_qs and delete_batch build SQL so we can combine fast_deletes\n@bug_localization\ndef show_deletequery_subqueries():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/db/models/sql/subqueries.py\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966cfdaeaf48197b4e37f9da0f42eba",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 9166,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 8960,
+              "text_tokens": null
+            },
+            "output_tokens": 1735,
+            "output_tokens_details": {
+              "reasoning_tokens": 1664,
+              "text_tokens": null
+            },
+            "total_tokens": 10901,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345605,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n\"\"\"\nQuery subclasses which provide extra functionality beyond simple data retrieval.\n\"\"\"\n\nfrom django.core.exceptions import FieldError\nfrom django.db import connections\nfrom django.db.models.query_utils import Q\nfrom django.db.models.sql.constants import (\n    CURSOR, GET_ITERATOR_CHUNK_SIZE, NO_RESULTS,\n)\nfrom django.db.models.sql.query import Query\n\n__all__ = ['DeleteQuery', 'UpdateQuery', 'InsertQuery', 'AggregateQuery']\n\n\nclass DeleteQuery(Query):\n    \"\"\"A DELETE SQL query.\"\"\"\n\n    compiler = 'SQLDeleteCompiler'\n\n    def do_query(self, table, where, using):\n        self.alias_map = {table: self.alias_map[table]}\n        self.where = where\n        cursor = self.get_compiler(using).execute_sql(CURSOR)\n        return cursor.rowcount if cursor else 0\n\n    def delete_batch(self, pk_list, using):\n        \"\"\"\n        Set up and execute delete queries for all the objects in pk_list.\n\n        More than one physical query may be executed if there are a\n        lot of values in pk_list.\n        \"\"\"\n        # number of objects deleted\n        num_deleted = 0\n        field = self.get_meta().pk\n        for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE):\n            self.where = self.where_class()\n            self.add_q(Q(\n                **{field.attname + '__in': pk_list[offset:offset + GET_ITERATOR_CHUNK_SIZE]}))\n            num_deleted += self.do_query(self.get_meta().db_table, self.where, using=using)\n        return num_deleted\n\n    def delete_qs(self, query, using):\n        \"\"\"\n        Delete the queryset in one SQL query (if possible). For simple queries\n        this is done by copying the query.query.where to self.query, for\n        complex queries by using subquery.\n        \"\"\"\n        innerq = query.query\n        # Make sure the inner query has at least one table in use.\n        innerq.get_initial_alias()\n        # The same for our new query.\n        self.get_initial_alias()\n        innerq_used_tables = tuple([t for t in innerq.alias_map if innerq.alias_refcount[t]])\n        if not innerq_used_tables or innerq_used_tables == tuple(self.alias_map):\n            # There is only the base table in use in the query.\n            self.where = innerq.where\n        else:\n            pk = query.model._meta.pk\n            if not connections[using].features.update_can_self_select:\n                # We can't do the delete using subquery.\n                values = list(query.values_list('pk', flat=True))\n                if not values:\n                    return 0\n                return self.delete_batch(values, using)\n            else:\n                innerq.clear_select_clause()\n                innerq.select = [\n                    pk.get_col(self.get_initial_alias())\n                ]\n                values = innerq\n            self.where = self.where_class()\n            self.add_q(Q(pk__in=values))\n        cursor = self.get_compiler(using).execute_sql(CURSOR)\n        return cursor.rowcount if cursor else 0\n\n\nclass UpdateQuery(Query):\n    \"\"\"An UPDATE SQL query.\"\"\"\n\n    compiler = 'SQLUpdateCompiler'\n\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._setup_query()\n\n    def _setup_query(self):\n        \"\"\"\n        Run on initialization and at the end of chaining. Any attributes that\n        would normally be set in __init__() should go here instead.\n        \"\"\"\n        self.values = []\n        self.related_ids = None\n        self.related_updates = {}\n\n    def clone(self):\n        obj = super().clone()\n        obj.related_updates = self.related_updates.copy()\n        return obj\n\n    def update_batch(self, pk_list, values, using):\n        self.add_update_values(values)\n        for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE):\n            self.where = self.where_class()\n            self.add_q(Q(pk__in=pk_list[offset: offset + GET_ITERATOR_CHUNK_SIZE]))\n            self.get_compiler(using).execute_sql(NO_RESULTS)\n\n    def add_update_values(self, values):\n        \"\"\"\n        Convert a dictionary of field name to value mappings into an update\n        query. This is the entry point for the public update() method on\n        querysets.\n        \"\"\"\n        values_seq = []\n        for name, val in values.items():\n            field = self.get_meta().get_field(name)\n            direct = not (field.auto_created and not field.concrete) or not field.concrete\n            model = field.model._meta.concrete_model\n            if not direct or (field.is_relation and field.many_to_many):\n                raise FieldError(\n                    'Cannot update model field %r (only non-relations and '\n                    'foreign keys permitted).' % field\n                )\n            if model is not self.get_meta().concrete_model:\n                self.add_related_update(model, field, val)\n                continue\n            values_seq.append((field, model, val))\n        return self.add_update_fields(values_seq)\n\n    def add_update_fields(self, values_seq):\n        \"\"\"\n        Append a sequence of (field, model, value) triples to the internal list\n        that will be used to generate the UPDATE query. Might be more usefully\n        called add_update_targets() to hint at the extra information here.\n        \"\"\"\n        for field, model, val in values_seq:\n            if hasattr(val, 'resolve_expression'):\n                # Resolve expressions here so that annotations are no longer needed\n                val = val.resolve_expression(self, allow_joins=False, for_save=True)\n            self.values.append((field, model, val))\n\n    def add_related_update(self, model, field, value):\n        \"\"\"\n        Add (name, value) to an update query for an ancestor model.\n\n        Update are coalesced so that only one update query per ancestor is run.\n        \"\"\"\n        self.related_updates.setdefault(model, []).append((field, None, value))\n\n    def get_related_updates(self):\n        \"\"\"\n        Return a list of query objects: one for each update required to an\n        ancestor model. Each query will have the same filtering conditions as\n        the current query but will only update a single table.\n        \"\"\"\n        if not self.related_updates:\n            return []\n        result = []\n        for model, values in self.related_updates.items():\n            query = UpdateQuery(model)\n            query.values = values\n            if self.related_ids is not None:\n                query.add_filter(('pk__in', self.related_ids))\n            result.append(query)\n        return result\n\n\nclass InsertQuery(Query):\n    compiler = 'SQLInsertCompiler'\n\n    def __init__(self, *args, ignore_conflicts=False, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.fields = []\n        self.objs = []\n        self.ignore_conflicts = ignore_conflicts\n\n    def insert_values(self, fields, objs, raw=False):\n        self.fields = fields\n        self.objs = objs\n        self.raw = raw\n\n\nclass AggregateQuery(Query):\n    \"\"\"\n    Take another query as a parameter to the FROM clause and only select the\n    elements in the provided list.\n    \"\"\"\n\n    compiler = 'SQLAggregateCompiler'\n\n    def add_subquery(self, query, using):\n        query.subquery = True\n        self.subquery, self.sub_params = query.get_compiler(using).as_sql(with_col_aliases=True)\n</output>",
+      "timestamp": 1768345605.764398
+    },
+    {
+      "role": "assistant",
+      "content": "# View NoFastDeleteCollector to ensure compatibility with changed fast_deletes structure\n@bug_localization\ndef show_nofastdeletecollector():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/contrib/contenttypes/management/commands/remove_stale_contenttypes.py\n    ```",
+      "timestamp": 1768345645.0316014,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmQwMDViZGRjODE5N2I4OTM5ODM5ZmI1NjNkZTY=",
+          "created_at": 1768345606,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966d006cad88197a921d034a6b289fd",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966d02a0c0c81979ead140955ea1974",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966d02b58448197bfd1ddad34fec46a",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966d02b7f8c8197987beba07c8ad17e",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966d02b9700819785993bed76c56f8c",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# View NoFastDeleteCollector to ensure compatibility with changed fast_deletes structure\n@bug_localization\ndef show_nofastdeletecollector():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/contrib/contenttypes/management/commands/remove_stale_contenttypes.py\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966cfe5d8f481978236d283fb1a83ef",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 10786,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 8960,
+              "text_tokens": null
+            },
+            "output_tokens": 2760,
+            "output_tokens_details": {
+              "reasoning_tokens": 2688,
+              "text_tokens": null
+            },
+            "total_tokens": 13546,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345644,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nfrom django.apps import apps\nfrom django.contrib.contenttypes.models import ContentType\nfrom django.core.management import BaseCommand\nfrom django.db import DEFAULT_DB_ALIAS, router\nfrom django.db.models.deletion import Collector\n\nfrom ...management import get_contenttypes_and_models\n\n\nclass Command(BaseCommand):\n\n    def add_arguments(self, parser):\n        parser.add_argument(\n            '--noinput', '--no-input', action='store_false', dest='interactive',\n            help='Tells Django to NOT prompt the user for input of any kind.',\n        )\n        parser.add_argument(\n            '--database', default=DEFAULT_DB_ALIAS,\n            help='Nominates the database to use. Defaults to the \"default\" database.',\n        )\n\n    def handle(self, **options):\n        db = options['database']\n        interactive = options['interactive']\n        verbosity = options['verbosity']\n\n        for app_config in apps.get_app_configs():\n            content_types, app_models = get_contenttypes_and_models(app_config, db, ContentType)\n            to_remove = [\n                ct for (model_name, ct) in content_types.items()\n                if model_name not in app_models\n            ]\n            # Confirm that the content type is stale before deletion.\n            using = router.db_for_write(ContentType)\n            if to_remove:\n                if interactive:\n                    ct_info = []\n                    for ct in to_remove:\n                        ct_info.append('    - Content type for %s.%s' % (ct.app_label, ct.model))\n                        collector = NoFastDeleteCollector(using=using)\n                        collector.collect([ct])\n\n                        for obj_type, objs in collector.data.items():\n                            if objs != {ct}:\n                                ct_info.append('    - %s %s object(s)' % (\n                                    len(objs),\n                                    obj_type._meta.label,\n                                ))\n                    content_type_display = '\\n'.join(ct_info)\n                    self.stdout.write(\"\"\"Some content types in your database are stale and can be deleted.\nAny objects that depend on these content types will also be deleted.\nThe content types and dependent objects that would be deleted are:\n\n%s\n\nThis list doesn't include any cascade deletions to data outside of Django's\nmodels (uncommon).\n\nAre you sure you want to delete these content types?\nIf you're unsure, answer 'no'.\\n\"\"\" % content_type_display)\n                    ok_to_delete = input(\"Type 'yes' to continue, or 'no' to cancel: \")\n                else:\n                    ok_to_delete = 'yes'\n\n                if ok_to_delete == 'yes':\n                    for ct in to_remove:\n                        if verbosity >= 2:\n                            self.stdout.write(\"Deleting stale content type '%s | %s'\" % (ct.app_label, ct.model))\n                        ct.delete()\n                else:\n                    if verbosity >= 2:\n                        self.stdout.write(\"Stale content types remain.\")\n\n\nclass NoFastDeleteCollector(Collector):\n    def can_fast_delete(self, *args, **kwargs):\n        \"\"\"\n        Always load related objects to display them when showing confirmation.\n        \"\"\"\n        return False\n</output>",
+      "timestamp": 1768345645.1965244
+    },
+    {
+      "role": "assistant",
+      "content": "# Inspect WhereNode implementation to see how to construct ORed where clauses\n@bug_localization\ndef show_where_node_impl():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/db/models/sql/where.py\n    ```",
+      "timestamp": 1768345683.3948066,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmQwMmQzMDk4ODE5NzlkMjBhNmUyMDc3ZWU1NzQ=",
+          "created_at": 1768345645,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966d02de780819783ae4301d20bfb77",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966d03e89e081979cea27c100a4f557",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966d0468a208197b09ed64e59f68851",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966d051ba4881978ed357f9a681554a",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Inspect WhereNode implementation to see how to construct ORed where clauses\n@bug_localization\ndef show_where_node_impl():\n    ```bash\n    cd /testbed && sed -n '1,240p' django/db/models/sql/where.py\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966d005bddc8197b8939839fb563de6",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 11494,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 9984,
+              "text_tokens": null
+            },
+            "output_tokens": 2301,
+            "output_tokens_details": {
+              "reasoning_tokens": 2240,
+              "text_tokens": null
+            },
+            "total_tokens": 13795,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345682,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n\"\"\"\nCode to manage the creation and SQL rendering of 'where' constraints.\n\"\"\"\n\nfrom django.core.exceptions import EmptyResultSet\nfrom django.utils import tree\nfrom django.utils.functional import cached_property\n\n# Connection types\nAND = 'AND'\nOR = 'OR'\n\n\nclass WhereNode(tree.Node):\n    \"\"\"\n    An SQL WHERE clause.\n\n    The class is tied to the Query class that created it (in order to create\n    the correct SQL).\n\n    A child is usually an expression producing boolean values. Most likely the\n    expression is a Lookup instance.\n\n    However, a child could also be any class with as_sql() and either\n    relabeled_clone() method or relabel_aliases() and clone() methods and\n    contains_aggregate attribute.\n    \"\"\"\n    default = AND\n    resolved = False\n    conditional = True\n\n    def split_having(self, negated=False):\n        \"\"\"\n        Return two possibly None nodes: one for those parts of self that\n        should be included in the WHERE clause and one for those parts of\n        self that must be included in the HAVING clause.\n        \"\"\"\n        if not self.contains_aggregate:\n            return self, None\n        in_negated = negated ^ self.negated\n        # If the effective connector is OR and this node contains an aggregate,\n        # then we need to push the whole branch to HAVING clause.\n        may_need_split = (\n            (in_negated and self.connector == AND) or\n            (not in_negated and self.connector == OR))\n        if may_need_split and self.contains_aggregate:\n            return None, self\n        where_parts = []\n        having_parts = []\n        for c in self.children:\n            if hasattr(c, 'split_having'):\n                where_part, having_part = c.split_having(in_negated)\n                if where_part is not None:\n                    where_parts.append(where_part)\n                if having_part is not None:\n                    having_parts.append(having_part)\n            elif c.contains_aggregate:\n                having_parts.append(c)\n            else:\n                where_parts.append(c)\n        having_node = self.__class__(having_parts, self.connector, self.negated) if having_parts else None\n        where_node = self.__class__(where_parts, self.connector, self.negated) if where_parts else None\n        return where_node, having_node\n\n    def as_sql(self, compiler, connection):\n        \"\"\"\n        Return the SQL version of the where clause and the value to be\n        substituted in. Return '', [] if this node matches everything,\n        None, [] if this node is empty, and raise EmptyResultSet if this\n        node can't match anything.\n        \"\"\"\n        result = []\n        result_params = []\n        if self.connector == AND:\n            full_needed, empty_needed = len(self.children), 1\n        else:\n            full_needed, empty_needed = 1, len(self.children)\n\n        for child in self.children:\n            try:\n                sql, params = compiler.compile(child)\n            except EmptyResultSet:\n                empty_needed -= 1\n            else:\n                if sql:\n                    result.append(sql)\n                    result_params.extend(params)\n                else:\n                    full_needed -= 1\n            # Check if this node matches nothing or everything.\n            # First check the amount of full nodes and empty nodes\n            # to make this node empty/full.\n            # Now, check if this node is full/empty using the\n            # counts.\n            if empty_needed == 0:\n                if self.negated:\n                    return '', []\n                else:\n                    raise EmptyResultSet\n            if full_needed == 0:\n                if self.negated:\n                    raise EmptyResultSet\n                else:\n                    return '', []\n        conn = ' %s ' % self.connector\n        sql_string = conn.join(result)\n        if sql_string:\n            if self.negated:\n                # Some backends (Oracle at least) need parentheses\n                # around the inner SQL in the negated case, even if the\n                # inner SQL contains just a single expression.\n                sql_string = 'NOT (%s)' % sql_string\n            elif len(result) > 1 or self.resolved:\n                sql_string = '(%s)' % sql_string\n        return sql_string, result_params\n\n    def get_group_by_cols(self, alias=None):\n        cols = []\n        for child in self.children:\n            cols.extend(child.get_group_by_cols())\n        return cols\n\n    def get_source_expressions(self):\n        return self.children[:]\n\n    def set_source_expressions(self, children):\n        assert len(children) == len(self.children)\n        self.children = children\n\n    def relabel_aliases(self, change_map):\n        \"\"\"\n        Relabel the alias values of any children. 'change_map' is a dictionary\n        mapping old (current) alias values to the new values.\n        \"\"\"\n        for pos, child in enumerate(self.children):\n            if hasattr(child, 'relabel_aliases'):\n                # For example another WhereNode\n                child.relabel_aliases(change_map)\n            elif hasattr(child, 'relabeled_clone'):\n                self.children[pos] = child.relabeled_clone(change_map)\n\n    def clone(self):\n        \"\"\"\n        Create a clone of the tree. Must only be called on root nodes (nodes\n        with empty subtree_parents). Childs must be either (Constraint, lookup,\n        value) tuples, or objects supporting .clone().\n        \"\"\"\n        clone = self.__class__._new_instance(\n            children=[], connector=self.connector, negated=self.negated)\n        for child in self.children:\n            if hasattr(child, 'clone'):\n                clone.children.append(child.clone())\n            else:\n                clone.children.append(child)\n        return clone\n\n    def relabeled_clone(self, change_map):\n        clone = self.clone()\n        clone.relabel_aliases(change_map)\n        return clone\n\n    @classmethod\n    def _contains_aggregate(cls, obj):\n        if isinstance(obj, tree.Node):\n            return any(cls._contains_aggregate(c) for c in obj.children)\n        return obj.contains_aggregate\n\n    @cached_property\n    def contains_aggregate(self):\n        return self._contains_aggregate(self)\n\n    @classmethod\n    def _contains_over_clause(cls, obj):\n        if isinstance(obj, tree.Node):\n            return any(cls._contains_over_clause(c) for c in obj.children)\n        return obj.contains_over_clause\n\n    @cached_property\n    def contains_over_clause(self):\n        return self._contains_over_clause(self)\n\n    @property\n    def is_summary(self):\n        return any(child.is_summary for child in self.children)\n\n    @staticmethod\n    def _resolve_leaf(expr, query, *args, **kwargs):\n        if hasattr(expr, 'resolve_expression'):\n            expr = expr.resolve_expression(query, *args, **kwargs)\n        return expr\n\n    @classmethod\n    def _resolve_node(cls, node, query, *args, **kwargs):\n        if hasattr(node, 'children'):\n            for child in node.children:\n                cls._resolve_node(child, query, *args, **kwargs)\n        if hasattr(node, 'lhs'):\n            node.lhs = cls._resolve_leaf(node.lhs, query, *args, **kwargs)\n        if hasattr(node, 'rhs'):\n            node.rhs = cls._resolve_leaf(node.rhs, query, *args, **kwargs)\n\n    def resolve_expression(self, *args, **kwargs):\n        clone = self.clone()\n        clone._resolve_node(clone, *args, **kwargs)\n        clone.resolved = True\n        return clone\n\n\nclass NothingNode:\n    \"\"\"A node that matches nothing.\"\"\"\n    contains_aggregate = False\n\n    def as_sql(self, compiler=None, connection=None):\n        raise EmptyResultSet\n\n\nclass ExtraWhere:\n    # The contents are a black box - assume no aggregates are used.\n    contains_aggregate = False\n\n    def __init__(self, sqls, params):\n        self.sqls = sqls\n        self.params = params\n\n    def as_sql(self, compiler=None, connection=None):\n        sqls = [\"(%s)\" % sql for sql in self.sqls]\n        return \" AND \".join(sqls), list(self.params or ())\n\n\nclass SubqueryConstraint:\n    # Even if aggregates would be used in a subquery, the outer query isn't\n    # interested about those.\n    contains_aggregate = False\n\n    def __init__(self, alias, columns, targets, query_object):\n        self.alias = alias\n        self.columns = columns\n        self.targets = targets\n        self.query_object = query_object\n\n</output>",
+      "timestamp": 1768345683.5464752
+    },
+    {
+      "role": "assistant",
+      "content": "# Combine fast delete QuerySets by model/table to reduce DB roundtrips\n@patch_generation\ndef patch_collector_combine_fast_deletes():\n    ```bash\n    cd /testbed && python - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/deletion.py')\ns = p.read_text()\n\nstart_marker = '\\n            # fast deletes\\n'\nend_marker = '\\n\\n            # update fields\\n'\nstart = s.find(start_marker)\nif start == -1:\n    raise SystemExit(\"start marker not found\")\nstart_body = start + len(start_marker)\nend = s.find(end_marker, start_body)\nif end == -1:\n    raise SystemExit(\"end marker not found\")\n\nnew_block = (\n\"            # Combine fast delete queries by model/table to reduce DB roundtrips\\n\"\n\"            groups = {}\\n\"\n\"            for qs in self.fast_deletes:\\n\"\n\"                key = (qs.model._meta.label, qs.model._meta.db_table)\\n\"\n\"                groups.setdefault(key, []).append(qs)\\n\"\n\"            for (label, _), qss in groups.items():\\n\"\n\"                if len(qss) == 1:\\n\"\n\"                    qs = qss[0]\\n\"\n\"                    count = qs._raw_delete(using=self.using)\\n\"\n\"                    deleted_counter[label] += count\\n\"\n\"                    continue\\n\"\n\"                try:\\n\"\n\"                    base_qs = qss[0]._chain()\\n\"\n\"                    # Build a WhereNode combining each queryset's WHERE with OR.\\n\"\n\"                    where_children = [q.query.where for q in qss]\\n\"\n\"                    combined_where = base_qs.query.where_class(where_children, 'OR')\\n\"\n\"                    base_qs.query.where = combined_where\\n\"\n\"                    count = base_qs._raw_delete(using=self.using)\\n\"\n\"                    deleted_counter[label] += count\\n\"\n\"                except Exception:\\n\"\n\"                    for qs in qss:\\n\"\n\"                        count = qs._raw_delete(using=self.using)\\n\"\n\"                        deleted_counter[qs.model._meta.label] += count\\n\\n\"\n)\n\nnew_s = s[:start] + start_marker + new_block + s[end + len(end_marker):]\np.write_text(new_s)\n\nimport py_compile\npy_compile.compile(str(p), doraise=True)\nprint(\"patched and compiled\")\nPY\n```",
+      "timestamp": 1768345875.4658177,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmQwNTM4NDg0ODE5N2E1NmQ5ZmE5NDg0ZWY4ZmQ=",
+          "created_at": 1768345684,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966d0548c248197a6906a09cbd9665f",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966d0976f748197a56bf2d323579e8e",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966d10b55308197870a5afed7ee68af",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Combine fast delete QuerySets by model/table to reduce DB roundtrips\n@patch_generation\ndef patch_collector_combine_fast_deletes():\n    ```bash\n    cd /testbed && python - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/deletion.py')\ns = p.read_text()\n\nstart_marker = '\\n            # fast deletes\\n'\nend_marker = '\\n\\n            # update fields\\n'\nstart = s.find(start_marker)\nif start == -1:\n    raise SystemExit(\"start marker not found\")\nstart_body = start + len(start_marker)\nend = s.find(end_marker, start_body)\nif end == -1:\n    raise SystemExit(\"end marker not found\")\n\nnew_block = (\n\"            # Combine fast delete queries by model/table to reduce DB roundtrips\\n\"\n\"            groups = {}\\n\"\n\"            for qs in self.fast_deletes:\\n\"\n\"                key = (qs.model._meta.label, qs.model._meta.db_table)\\n\"\n\"                groups.setdefault(key, []).append(qs)\\n\"\n\"            for (label, _), qss in groups.items():\\n\"\n\"                if len(qss) == 1:\\n\"\n\"                    qs = qss[0]\\n\"\n\"                    count = qs._raw_delete(using=self.using)\\n\"\n\"                    deleted_counter[label] += count\\n\"\n\"                    continue\\n\"\n\"                try:\\n\"\n\"                    base_qs = qss[0]._chain()\\n\"\n\"                    # Build a WhereNode combining each queryset's WHERE with OR.\\n\"\n\"                    where_children = [q.query.where for q in qss]\\n\"\n\"                    combined_where = base_qs.query.where_class(where_children, 'OR')\\n\"\n\"                    base_qs.query.where = combined_where\\n\"\n\"                    count = base_qs._raw_delete(using=self.using)\\n\"\n\"                    deleted_counter[label] += count\\n\"\n\"                except Exception:\\n\"\n\"                    for qs in qss:\\n\"\n\"                        count = qs._raw_delete(using=self.using)\\n\"\n\"                        deleted_counter[qs.model._meta.label] += count\\n\\n\"\n)\n\nnew_s = s[:start] + start_marker + new_block + s[end + len(end_marker):]\np.write_text(new_s)\n\nimport py_compile\npy_compile.compile(str(p), doraise=True)\nprint(\"patched and compiled\")\nPY\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966d02d309881979d20a6e2077ee574",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 13338,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 11008,
+              "text_tokens": null
+            },
+            "output_tokens": 11011,
+            "output_tokens_details": {
+              "reasoning_tokens": 10496,
+              "text_tokens": null
+            },
+            "total_tokens": 24349,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345875,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\npatched and compiled\n</output>",
+      "timestamp": 1768345875.6384943
+    },
+    {
+      "role": "assistant",
+      "content": "# Run a reproduction that creates models, triggers deletions and prints SQL to verify combined fast-deletes\n@patch_verification\ndef run_repro_and_check_combined_fast_deletes():\n    ```bash\n    python - <<'PY'\nfrom pathlib import Path\n# create a small test app with models\nPath('testapp').mkdir(exist_ok=True)\nPath('testapp/__init__.py').write_text(\"default_app_config='testapp.apps.TestAppConfig'\\n\")\nPath('testapp/apps.py').write_text('''from django.apps import AppConfig\nclass TestAppConfig(AppConfig):\n    name = 'testapp'\n    verbose_name = 'Test App'\n''')\nPath('testapp/models.py').write_text('''from django.db import models\nclass User(models.Model):\n    pass\nclass Entry(models.Model):\n    created_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='created_entries')\n    updated_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='updated_entries')\nclass Person(models.Model):\n    friends = models.ManyToManyField('self', symmetrical=False, related_name='friends_rel')\n''')\n\n# minimal Django setup\nfrom django.conf import settings\nif not settings.configured:\n    settings.configure(\n        DEBUG=True,\n        SECRET_KEY='test',\n        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n        INSTALLED_APPS=['testapp'],\n    )\n\nimport django\ndjango.setup()\n\nfrom testapp.models import User, Entry, Person\nfrom django.db import connection\nfrom django.test.utils import CaptureQueriesContext\n\n# create tables (including m2m through tables)\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(User)\n    schema_editor.create_model(Entry)\n    schema_editor.create_model(Person)\n    for field in Person._meta.local_many_to_many:\n        through = field.remote_field.through\n        schema_editor.create_model(through)\n\n# create instances and relations\nu = User.objects.create()\nEntry.objects.create(created_by=u, updated_by=u)\np1 = Person.objects.create()\np2 = Person.objects.create()\np1.friends.add(p2)\np2.friends.add(p1)\n\n# capture and print SQL for deleting a person\nprint(\"=== SQL for person.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    p1.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\n\n# capture and print SQL for deleting a user\nprint(\"\\n=== SQL for user.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    u.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\nPY\n```",
+      "timestamp": 1768345975.4384341,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmQxMTM5YzljODE5N2EzNWQ5YWQzMWY5ZTI3MTQ=",
+          "created_at": 1768345876,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966d114c66881979382c4ff5854ae27",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_01a1a6a974ebdb82006966d13bb68081979f6562b7eebd3f11",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966d16e3f5c8197ab2b83004872c27a",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Run a reproduction that creates models, triggers deletions and prints SQL to verify combined fast-deletes\n@patch_verification\ndef run_repro_and_check_combined_fast_deletes():\n    ```bash\n    python - <<'PY'\nfrom pathlib import Path\n# create a small test app with models\nPath('testapp').mkdir(exist_ok=True)\nPath('testapp/__init__.py').write_text(\"default_app_config='testapp.apps.TestAppConfig'\\n\")\nPath('testapp/apps.py').write_text('''from django.apps import AppConfig\nclass TestAppConfig(AppConfig):\n    name = 'testapp'\n    verbose_name = 'Test App'\n''')\nPath('testapp/models.py').write_text('''from django.db import models\nclass User(models.Model):\n    pass\nclass Entry(models.Model):\n    created_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='created_entries')\n    updated_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='updated_entries')\nclass Person(models.Model):\n    friends = models.ManyToManyField('self', symmetrical=False, related_name='friends_rel')\n''')\n\n# minimal Django setup\nfrom django.conf import settings\nif not settings.configured:\n    settings.configure(\n        DEBUG=True,\n        SECRET_KEY='test',\n        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n        INSTALLED_APPS=['testapp'],\n    )\n\nimport django\ndjango.setup()\n\nfrom testapp.models import User, Entry, Person\nfrom django.db import connection\nfrom django.test.utils import CaptureQueriesContext\n\n# create tables (including m2m through tables)\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(User)\n    schema_editor.create_model(Entry)\n    schema_editor.create_model(Person)\n    for field in Person._meta.local_many_to_many:\n        through = field.remote_field.through\n        schema_editor.create_model(through)\n\n# create instances and relations\nu = User.objects.create()\nEntry.objects.create(created_by=u, updated_by=u)\np1 = Person.objects.create()\np2 = Person.objects.create()\np1.friends.add(p2)\np2.friends.add(p1)\n\n# capture and print SQL for deleting a person\nprint(\"=== SQL for person.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    p1.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\n\n# capture and print SQL for deleting a user\nprint(\"\\n=== SQL for user.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    u.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\nPY\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966d05384848197a56d9fa9484ef8fd",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 13876,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 13184,
+              "text_tokens": null
+            },
+            "output_tokens": 7098,
+            "output_tokens_details": {
+              "reasoning_tokens": 6528,
+              "text_tokens": null
+            },
+            "total_tokens": 20974,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768345974,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>1</returncode>\n<output>\nTraceback (most recent call last):\n  File \"/testbed/django/db/backends/utils.py\", line 84, in _execute\n    return self.cursor.execute(sql)\n  File \"/testbed/django/db/backends/sqlite3/base.py\", line 394, in execute\n    return Database.Cursor.execute(self, query)\nsqlite3.OperationalError: table \"testapp_person_friends\" already exists\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"<stdin>\", line 44, in <module>\n  File \"/testbed/django/db/backends/base/schema.py\", line 324, in create_model\n    self.execute(sql, params or None)\n  File \"/testbed/django/db/backends/base/schema.py\", line 142, in execute\n    cursor.execute(sql, params)\n  File \"/testbed/django/db/backends/utils.py\", line 100, in execute\n    return super().execute(sql, params)\n  File \"/testbed/django/db/backends/utils.py\", line 68, in execute\n    return self._execute_with_wrappers(sql, params, many=False, executor=self._execute)\n  File \"/testbed/django/db/backends/utils.py\", line 77, in _execute_with_wrappers\n    return executor(sql, params, many, context)\n  File \"/testbed/django/db/backends/utils.py\", line 86, in _execute\n    return self.cursor.execute(sql, params)\n  File \"/testbed/django/db/utils.py\", line 90, in __exit__\n    raise dj_exc_value.with_traceback(traceback) from exc_value\n  File \"/testbed/django/db/backends/utils.py\", line 84, in _execute\n    return self.cursor.execute(sql)\n  File \"/testbed/django/db/backends/sqlite3/base.py\", line 394, in execute\n    return Database.Cursor.execute(self, query)\ndjango.db.utils.OperationalError: table \"testapp_person_friends\" already exists\n</output>",
+      "timestamp": 1768345975.914442
+    },
+    {
+      "role": "assistant",
+      "content": "# Avoid create_model collision by checking existing tables, then run repro to inspect SQL emitted\n@patch_verification\ndef run_repro_and_handle_existing_tables_to_verify_combined_fast_deletes():\n    ```bash\n    cd /testbed && python - <<'PY'\nfrom pathlib import Path\n# (Re)create test app\nPath('testapp').mkdir(exist_ok=True)\nPath('testapp/__init__.py').write_text(\"default_app_config='testapp.apps.TestAppConfig'\\n\")\nPath('testapp/apps.py').write_text('''from django.apps import AppConfig\nclass TestAppConfig(AppConfig):\n    name = 'testapp'\n    verbose_name = 'Test App'\n''')\nPath('testapp/models.py').write_text('''from django.db import models\nclass User(models.Model):\n    pass\nclass Entry(models.Model):\n    created_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='created_entries')\n    updated_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='updated_entries')\nclass Person(models.Model):\n    friends = models.ManyToManyField('self', symmetrical=False, related_name='friends_rel')\n''')\n\nfrom django.conf import settings\nif not settings.configured:\n    settings.configure(\n        DEBUG=True,\n        SECRET_KEY='test',\n        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n        INSTALLED_APPS=['testapp'],\n    )\n\nimport django\ndjango.setup()\n\nfrom django.db import connection\nfrom testapp.models import User, Entry, Person\nfrom django.test.utils import CaptureQueriesContext\n\n# Create tables only if they don't exist to avoid collisions across runs\nwith connection.schema_editor() as schema_editor:\n    existing = connection.introspection.table_names()\n    for model in (User, Entry, Person):\n        if model._meta.db_table not in existing:\n            schema_editor.create_model(model)\n            existing = connection.introspection.table_names()\n    for field in Person._meta.local_many_to_many:\n        through = field.remote_field.through\n        if through._meta.db_table not in existing:\n            schema_editor.create_model(through)\n            existing = connection.introspection.table_names()\n\n# Create instances and relations\nu = User.objects.create()\nEntry.objects.create(created_by=u, updated_by=u)\np1 = Person.objects.create()\np2 = Person.objects.create()\np1.friends.add(p2)\np2.friends.add(p1)\n\n# Capture and print SQL emitted for deletions\nprint(\"=== SQL for person.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    p1.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\n\nprint(\"\\n=== SQL for user.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    u.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\nPY\n```",
+      "timestamp": 1768346022.8333569,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmQxNzdlMzEwODE5Nzg3ZDM2Mjc5Yjc0MjJhMDk=",
+          "created_at": 1768345976,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966d178dad4819786ec52fc530bb4b5",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966d19e408c8197b0a15a3648cba6d1",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Avoid create_model collision by checking existing tables, then run repro to inspect SQL emitted\n@patch_verification\ndef run_repro_and_handle_existing_tables_to_verify_combined_fast_deletes():\n    ```bash\n    cd /testbed && python - <<'PY'\nfrom pathlib import Path\n# (Re)create test app\nPath('testapp').mkdir(exist_ok=True)\nPath('testapp/__init__.py').write_text(\"default_app_config='testapp.apps.TestAppConfig'\\n\")\nPath('testapp/apps.py').write_text('''from django.apps import AppConfig\nclass TestAppConfig(AppConfig):\n    name = 'testapp'\n    verbose_name = 'Test App'\n''')\nPath('testapp/models.py').write_text('''from django.db import models\nclass User(models.Model):\n    pass\nclass Entry(models.Model):\n    created_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='created_entries')\n    updated_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='updated_entries')\nclass Person(models.Model):\n    friends = models.ManyToManyField('self', symmetrical=False, related_name='friends_rel')\n''')\n\nfrom django.conf import settings\nif not settings.configured:\n    settings.configure(\n        DEBUG=True,\n        SECRET_KEY='test',\n        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n        INSTALLED_APPS=['testapp'],\n    )\n\nimport django\ndjango.setup()\n\nfrom django.db import connection\nfrom testapp.models import User, Entry, Person\nfrom django.test.utils import CaptureQueriesContext\n\n# Create tables only if they don't exist to avoid collisions across runs\nwith connection.schema_editor() as schema_editor:\n    existing = connection.introspection.table_names()\n    for model in (User, Entry, Person):\n        if model._meta.db_table not in existing:\n            schema_editor.create_model(model)\n            existing = connection.introspection.table_names()\n    for field in Person._meta.local_many_to_many:\n        through = field.remote_field.through\n        if through._meta.db_table not in existing:\n            schema_editor.create_model(through)\n            existing = connection.introspection.table_names()\n\n# Create instances and relations\nu = User.objects.create()\nEntry.objects.create(created_by=u, updated_by=u)\np1 = Person.objects.create()\np2 = Person.objects.create()\np1.friends.add(p2)\np2.friends.add(p1)\n\n# Capture and print SQL emitted for deletions\nprint(\"=== SQL for person.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    p1.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\n\nprint(\"\\n=== SQL for user.delete() ===\")\nwith CaptureQueriesContext(connection) as captured:\n    u.delete()\nfor q in captured.captured_queries:\n    print(q['sql'])\nPY\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966d1139c9c8197a35d9ad31f9e2714",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 14888,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 13184,
+              "text_tokens": null
+            },
+            "output_tokens": 3488,
+            "output_tokens_details": {
+              "reasoning_tokens": 2880,
+              "text_tokens": null
+            },
+            "total_tokens": 18376,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768346022,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n=== SQL for person.delete() ===\nBEGIN\nDELETE FROM \"testapp_person_friends\" WHERE (\"testapp_person_friends\".\"from_person_id\" IN (1) OR \"testapp_person_friends\".\"to_person_id\" IN (1))\nDELETE FROM \"testapp_person\" WHERE \"testapp_person\".\"id\" IN (1)\n\n=== SQL for user.delete() ===\nBEGIN\nDELETE FROM \"testapp_entry\" WHERE (\"testapp_entry\".\"created_by_id\" IN (1) OR \"testapp_entry\".\"updated_by_id\" IN (1))\nDELETE FROM \"testapp_user\" WHERE \"testapp_user\".\"id\" IN (1)\n</output>",
+      "timestamp": 1768346023.158695
+    },
+    {
+      "role": "assistant",
+      "content": "# Fast-delete queries combined by table; reproduction showed OR-combined WHERE clauses. Stage done \u2014 staging changes and showing diff to submit.\n@debug\ndef submit_changes_and_show_staged_diff():\n    ```bash\n    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n    ```",
+      "timestamp": 1768346044.3705897,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDFhMWE2YTk3NGViZGI4MjAwNjk2NmQxYTcyMzYwODE5Nzk1OTg5MTY5ZmY2NWM4MDk=",
+          "created_at": 1768346023,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_01a1a6a974ebdb82006966d1a98d50819799062d9907e3a241",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_01a1a6a974ebdb82006966d1bab06c819798c5f18b80355760",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "# Fast-delete queries combined by table; reproduction showed OR-combined WHERE clauses. Stage done \u2014 staging changes and showing diff to submit.\n@debug\ndef submit_changes_and_show_staged_diff():\n    ```bash\n    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n    ```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_01a1a6a974ebdb82006966d177e310819787d36279b7422a09",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 15649,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 14208,
+              "text_tokens": null
+            },
+            "output_tokens": 1287,
+            "output_tokens_details": {
+              "reasoning_tokens": 1216,
+              "text_tokens": null
+            },
+            "total_tokens": 16936,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768346043,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py\nindex ae82d26340..0c10f5410d 100644\n--- a/django/db/models/deletion.py\n+++ b/django/db/models/deletion.py\n@@ -310,11 +310,30 @@ class Collector:\n                     )\n \n             # fast deletes\n+            # Combine fast delete queries by model/table to reduce DB roundtrips\n+            groups = {}\n             for qs in self.fast_deletes:\n-                count = qs._raw_delete(using=self.using)\n-                deleted_counter[qs.model._meta.label] += count\n+                key = (qs.model._meta.label, qs.model._meta.db_table)\n+                groups.setdefault(key, []).append(qs)\n+            for (label, _), qss in groups.items():\n+                if len(qss) == 1:\n+                    qs = qss[0]\n+                    count = qs._raw_delete(using=self.using)\n+                    deleted_counter[label] += count\n+                    continue\n+                try:\n+                    base_qs = qss[0]._chain()\n+                    # Build a WhereNode combining each queryset's WHERE with OR.\n+                    where_children = [q.query.where for q in qss]\n+                    combined_where = base_qs.query.where_class(where_children, 'OR')\n+                    base_qs.query.where = combined_where\n+                    count = base_qs._raw_delete(using=self.using)\n+                    deleted_counter[label] += count\n+                except Exception:\n+                    for qs in qss:\n+                        count = qs._raw_delete(using=self.using)\n+                        deleted_counter[qs.model._meta.label] += count\n \n-            # update fields\n             for model, instances_for_fieldvalues in self.field_updates.items():\n                 for (field, value), instances in instances_for_fieldvalues.items():\n                     query = sql.UpdateQuery(model)\ndiff --git a/testapp/__init__.py b/testapp/__init__.py\nnew file mode 100644\nindex 0000000000..26c1a343d2\n--- /dev/null\n+++ b/testapp/__init__.py\n@@ -0,0 +1 @@\n+default_app_config='testapp.apps.TestAppConfig'\ndiff --git a/testapp/apps.py b/testapp/apps.py\nnew file mode 100644\nindex 0000000000..ba62d7ac81\n--- /dev/null\n+++ b/testapp/apps.py\n@@ -0,0 +1,4 @@\n+from django.apps import AppConfig\n+class TestAppConfig(AppConfig):\n+    name = 'testapp'\n+    verbose_name = 'Test App'\ndiff --git a/testapp/models.py b/testapp/models.py\nnew file mode 100644\nindex 0000000000..d953f98cfd\n--- /dev/null\n+++ b/testapp/models.py\n@@ -0,0 +1,8 @@\n+from django.db import models\n+class User(models.Model):\n+    pass\n+class Entry(models.Model):\n+    created_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='created_entries')\n+    updated_by = models.ForeignKey('testapp.User', on_delete=models.CASCADE, related_name='updated_entries')\n+class Person(models.Model):\n+    friends = models.ManyToManyField('self', symmetrical=False, related_name='friends_rel')\n",
+      "timestamp": 1768346044.7556872
+    }
+  ],
+  "trajectory_format": "mini-swe-agent-1",
+  "instance_id": "django__django-11885"
+}
