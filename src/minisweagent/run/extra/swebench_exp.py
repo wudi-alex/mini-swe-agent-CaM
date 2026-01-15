@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run mini-SWE-agent with ExperimentAgent on SWE-bench instances in batch mode."""
+"""Run mini-SWE-agent on SWE-bench instances in batch mode."""
 # Read this first: https://mini-swe-agent.com/latest/usage/swebench/  (usage docs)
 
 import concurrent.futures
@@ -27,9 +27,7 @@ from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.utils.save import save_traj
 from minisweagent.utils.log import add_file_handler, logger
 
-_HELP_TEXT = """Run mini-SWE-agent with ExperimentAgent on SWEBench instances.
-
-This version includes project folder structure in the system prompt and advanced model consultation.
+_HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
 
 [not dim]
 More information about the usage: [bold green]https://mini-swe-agent.com/latest/usage/swebench/[/bold green]
@@ -48,17 +46,19 @@ DATASET_MAPPING = {
     "_test": "klieret/swe-bench-dummy-test-dataset",
 }
 
-
 _OUTPUT_FILE_LOCK = threading.Lock()
 
 
-class ProgressTrackingExperimentAgent(ExperimentAgent):
-    """Wrapper around ExperimentAgent that provides progress updates."""
+class ProgressTrackingAgent(ExperimentAgent):
+    """Simple wrapper around DefaultAgent that provides progress updates."""
 
     def __init__(self, *args, progress_manager: RunBatchProgressManager, instance_id: str = "", **kwargs):
-        super().__init__(*args, **kwargs)
+        # Extract progress_manager and instance_id before passing to parent
         self.progress_manager: RunBatchProgressManager = progress_manager
         self.instance_id = instance_id
+
+        # Pass all other kwargs (including reasoning_strategy params) to parent
+        super().__init__(*args, **kwargs)
 
     def step(self) -> dict:
         """Override step to provide progress updates."""
@@ -122,18 +122,12 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
 
 
 def process_instance(
-    instance: dict,
-    output_dir: Path,
-    config: dict,
-    progress_manager: RunBatchProgressManager,
-    max_folder_depth: int = 3,
-    ignored_dirs: set[str] = None,
-    advanced_model_name: str = None,
-    consultation_strategy: str = "ASK_BY_AGENT",
-    routine_ask_interval: int = 5,
-    initial_analysis: bool = False,
+        instance: dict,
+        output_dir: Path,
+        config: dict,
+        progress_manager: RunBatchProgressManager,
 ) -> None:
-    """Process a single SWEBench instance with ExperimentAgent."""
+    """Process a single SWEBench instance."""
     instance_id = instance["instance_id"]
     instance_dir = output_dir / instance_id
     # avoid inconsistent state if something here fails and there's leftover previous files
@@ -150,19 +144,36 @@ def process_instance(
 
     try:
         env = get_sb_environment(config, instance)
-        agent = ProgressTrackingExperimentAgent(
+
+        # Extract reasoning strategy configuration from config
+        reasoning_config = config.get("reasoning_strategy", {})
+        reasoning_strategy = reasoning_config.get("strategy", None)
+        high_reasoning_first_round = reasoning_config.get("high_reasoning_first_round", 3)
+        routine_high_reasoning_interval = reasoning_config.get("routine_high_reasoning_interval", 5)
+
+        # Prepare agent configuration with reasoning strategy parameters
+        agent_config = config.get("agent", {}).copy()
+
+        # Add reasoning strategy parameters to agent config if strategy is enabled
+        if reasoning_strategy:
+            agent_config["reasoning_strategy"] = reasoning_strategy
+            agent_config["high_reasoning_first_round"] = high_reasoning_first_round
+            agent_config["routine_high_reasoning_interval"] = routine_high_reasoning_interval
+
+            # Log reasoning strategy info (only for first instance to avoid spam)
+            logger.debug(f"[{instance_id}] Reasoning strategy: {reasoning_strategy}")
+            logger.debug(f"[{instance_id}]   - high_reasoning_first_round: {high_reasoning_first_round}")
+            logger.debug(f"[{instance_id}]   - routine_high_reasoning_interval: {routine_high_reasoning_interval}")
+
+        # Create agent with progress tracking and reasoning strategy support
+        agent = ProgressTrackingAgent(
             model,
             env,
             progress_manager=progress_manager,
             instance_id=instance_id,
-            max_folder_depth=max_folder_depth,
-            ignored_dirs=ignored_dirs,
-            advanced_model_name=advanced_model_name,
-            consultation_strategy=consultation_strategy,
-            routine_ask_interval=routine_ask_interval,
-            initial_analysis=initial_analysis,
-            **config.get("agent", {}),
+            **agent_config,
         )
+
         exit_status, result = agent.run(task)
     except Exception as e:
         logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
@@ -183,7 +194,7 @@ def process_instance(
 
 
 def filter_instances(
-    instances: list[dict], *, filter_spec: str, slice_spec: str = "", shuffle: bool = False
+        instances: list[dict], *, filter_spec: str, slice_spec: str = "", shuffle: bool = False
 ) -> list[dict]:
     """Filter and slice a list of SWEBench instances."""
     if shuffle:
@@ -205,24 +216,28 @@ def filter_instances(
 # fmt: off
 @app.command(help=_HELP_TEXT)
 def main(
-    subset: str = typer.Option("lite", "--subset", help="SWEBench subset to use or path to a dataset", rich_help_panel="Data selection"),
-    split: str = typer.Option("dev", "--split", help="Dataset split", rich_help_panel="Data selection"),
-    slice_spec: str = typer.Option("", "--slice", help="Slice specification (e.g., '0:5' for first 5 instances)", rich_help_panel="Data selection"),
-    filter_spec: str = typer.Option("", "--filter", help="Filter instance IDs by regex", rich_help_panel="Data selection"),
-    shuffle: bool = typer.Option(False, "--shuffle", help="Shuffle instances", rich_help_panel="Data selection"),
-    output: str = typer.Option("", "-o", "--output", help="Output directory", rich_help_panel="Basic"),
-    workers: int = typer.Option(1, "-w", "--workers", help="Number of worker threads for parallel processing", rich_help_panel="Basic"),
-    model: str | None = typer.Option(None, "-m", "--model", help="Model to use", rich_help_panel="Basic"),
-    model_class: str | None = typer.Option(None, "-c", "--model-class", help="Model class to use (e.g., 'anthropic' or 'minisweagent.models.anthropic.AnthropicModel')", rich_help_panel="Advanced"),
-    redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
-    config_spec: Path = typer.Option(builtin_config_dir / "extra" / "swebench_exp.yaml", "-c", "--config", help="Path to a config file", rich_help_panel="Basic"),
-    environment_class: str | None = typer.Option(None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
-    max_folder_depth: int = typer.Option(3, "--max-folder-depth", help="Maximum depth for folder structure tree", rich_help_panel="ExperimentAgent"),
-    ignore_dirs: str = typer.Option(".git,__pycache__,.pytest_cache,node_modules,.venv,venv,.idea,.vscode,dist,build", "--ignore-dirs", help="Comma-separated list of directories to ignore", rich_help_panel="ExperimentAgent"),
-    advanced_model: str | None = typer.Option(None, "--advanced-model", help="Advanced model to consult when agent requests help (e.g., 'gpt-5', 'claude-opus-4')", rich_help_panel="ExperimentAgent"),
-    consultation_strategy: str = typer.Option("ASK_BY_AGENT", "--consultation-strategy", help="Consultation strategy: 'ASK_BY_AGENT' (agent decides) or 'ROUTINE_ASK' (periodic)", rich_help_panel="ExperimentAgent"),
-    routine_ask_interval: int = typer.Option(5, "--routine-ask-interval", help="Interval for routine consultation (only used with ROUTINE_ASK strategy)", rich_help_panel="ExperimentAgent"),
-    initial_analysis: bool = typer.Option(False, "--initial-analysis", help="Include advanced model's initial analysis in system prompt", rich_help_panel="ExperimentAgent"),
+        subset: str = typer.Option("lite", "--subset", help="SWEBench subset to use or path to a dataset",
+                                   rich_help_panel="Data selection"),
+        split: str = typer.Option("dev", "--split", help="Dataset split", rich_help_panel="Data selection"),
+        slice_spec: str = typer.Option("", "--slice", help="Slice specification (e.g., '0:5' for first 5 instances)",
+                                       rich_help_panel="Data selection"),
+        filter_spec: str = typer.Option("", "--filter", help="Filter instance IDs by regex",
+                                        rich_help_panel="Data selection"),
+        shuffle: bool = typer.Option(False, "--shuffle", help="Shuffle instances", rich_help_panel="Data selection"),
+        output: str = typer.Option("", "-o", "--output", help="Output directory", rich_help_panel="Basic"),
+        workers: int = typer.Option(1, "-w", "--workers", help="Number of worker threads for parallel processing",
+                                    rich_help_panel="Basic"),
+        model: str | None = typer.Option(None, "-m", "--model", help="Model to use", rich_help_panel="Basic"),
+        model_class: str | None = typer.Option(None, "-c", "--model-class",
+                                               help="Model class to use (e.g., 'anthropic' or 'minisweagent.models.anthropic.AnthropicModel')",
+                                               rich_help_panel="Advanced"),
+        redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances",
+                                           rich_help_panel="Data selection"),
+        config_spec: Path = typer.Option(builtin_config_dir / "extra" / "swebench_exp.yaml", "-c", "--config",
+                                         help="Path to a config file", rich_help_panel="Basic"),
+        environment_class: str | None = typer.Option(None, "--environment-class",
+                                                     help="Environment type to use. Recommended are docker or singularity",
+                                                     rich_help_panel="Advanced"),
 ) -> None:
     # fmt: on
     output_path = Path(output)
@@ -251,17 +266,16 @@ def main(
     if model_class is not None:
         config.setdefault("model", {})["model_class"] = model_class
 
-    # Parse ignored directories
-    ignored_dirs_set = set(d.strip() for d in ignore_dirs.split(",") if d.strip())
-    logger.info(f"ExperimentAgent Configuration:")
-    logger.info(f"  Ignoring directories: {ignored_dirs_set}")
-    logger.info(f"  Max folder depth: {max_folder_depth}")
-    if advanced_model:
-        logger.info(f"  Advanced model: {advanced_model}")
-        logger.info(f"  Consultation strategy: {consultation_strategy}")
-        if consultation_strategy == "ROUTINE_ASK":
-            logger.info(f"  Routine ask interval: every {routine_ask_interval} steps")
-        logger.info(f"  Initial analysis: {'enabled' if initial_analysis else 'disabled'}")
+    # Log reasoning strategy configuration
+    reasoning_config = config.get("reasoning_strategy", {})
+    reasoning_strategy = reasoning_config.get("strategy", None)
+    if reasoning_strategy:
+        logger.info(f"Reasoning strategy enabled: {reasoning_strategy}")
+        logger.info(f"  - high_reasoning_first_round: {reasoning_config.get('high_reasoning_first_round', 3)}")
+        logger.info(
+            f"  - routine_high_reasoning_interval: {reasoning_config.get('routine_high_reasoning_interval', 5)}")
+    else:
+        logger.info("No reasoning strategy configured")
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
@@ -279,19 +293,9 @@ def main(
     with Live(progress_manager.render_group, refresh_per_second=4):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(
-                    process_instance,
-                    instance,
-                    output_path,
-                    config,
-                    progress_manager,
-                    max_folder_depth,
-                    ignored_dirs_set,
-                    advanced_model,
-                    consultation_strategy,
-                    routine_ask_interval,
-                    initial_analysis,
-                ): instance["instance_id"]
+                executor.submit(process_instance, instance, output_path, config, progress_manager): instance[
+                    "instance_id"
+                ]
                 for instance in instances
             }
             try:

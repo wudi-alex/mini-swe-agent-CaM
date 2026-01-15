@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-
-"""Run on a single SWE-Bench instance with InteractiveExperimentAgent."""
+"""Run on a single SWE-Bench instance."""
 
 import traceback
 from pathlib import Path
@@ -28,10 +26,10 @@ DEFAULT_OUTPUT = global_config_dir / "astropy-13398-mini.traj.json"
 # fmt: off
 @app.command()
 def main(
-        subset: str = typer.Option("verified", "--subset", help="SWEBench subset to use or path to a dataset",
+        subset: str = typer.Option("lite", "--subset", help="SWEBench subset to use or path to a dataset",
                                    rich_help_panel="Data selection"),
         split: str = typer.Option("dev", "--split", help="Dataset split", rich_help_panel="Data selection"),
-        instance_spec: str = typer.Option("sphinx-doc__sphinx-10435", "-i", "--instance", help="SWE-Bench instance ID or index",
+        instance_spec: str = typer.Option(0, "-i", "--instance", help="SWE-Bench instance ID or index",
                                           rich_help_panel="Data selection"),
         model_name: str | None = typer.Option(None, "-m", "--model", help="Model to use", rich_help_panel="Basic"),
         model_class: str | None = typer.Option(None, "-c", "--model-class",
@@ -45,26 +43,9 @@ def main(
                                               rich_help_panel="Basic"),
         output: Path = typer.Option(DEFAULT_OUTPUT, "-o", "--output", help="Output trajectory file",
                                     rich_help_panel="Basic"),
-        max_folder_depth: int = typer.Option(1, "--max-folder-depth", help="Maximum depth for folder structure tree",
-                                             rich_help_panel="ExperimentAgent"),
-        ignore_dirs: str = typer.Option(
-            ".git,__pycache__,.pytest_cache,node_modules,.venv,venv,.idea,.vscode,dist,build", "--ignore-dirs",
-            help="Comma-separated list of directories to ignore", rich_help_panel="ExperimentAgent"),
-        advanced_model: str | None = typer.Option('openai/gpt-5', "--advanced-model",
-                                                  help="Advanced model to consult when agent requests help (e.g., 'gpt-5', 'claude-opus-4')",
-                                                  rich_help_panel="ExperimentAgent"),
-        consultation_strategy: str = typer.Option("ASK_BY_AGENT", "--consultation-strategy",
-                                                  help="Consultation strategy: 'ASK_BY_AGENT' (agent decides) or 'ROUTINE_ASK' (periodic)",
-                                                  rich_help_panel="ExperimentAgent"),
-        routine_ask_interval: int = typer.Option(5, "--routine-ask-interval",
-                                                 help="Interval for routine consultation (only used with ROUTINE_ASK strategy)",
-                                                 rich_help_panel="ExperimentAgent"),
-        initial_analysis: bool = typer.Option(True, "--initial-analysis",
-                                              help="Include advanced model's initial analysis in system prompt",
-                                              rich_help_panel="ExperimentAgent"),
 ) -> None:
     # fmt: on
-    """Run on a single SWE-Bench instance with InteractiveExperimentAgent."""
+    """Run on a single SWE-Bench instance."""
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading dataset from {dataset_path}, split {split}...")
     instances = {
@@ -85,29 +66,30 @@ def main(
     if exit_immediately:
         config.setdefault("agent", {})["confirm_exit"] = False
 
-    # Parse ignored directories
-    ignored_dirs_set = set(d.strip() for d in ignore_dirs.split(",") if d.strip())
-    logger.info(f"Using InteractiveExperimentAgent with folder structure rendering")
-    logger.info(f"  Max folder depth: {max_folder_depth}")
-    logger.info(f"  Ignoring directories: {ignored_dirs_set}")
-    if advanced_model:
-        logger.info(f"  Advanced model: {advanced_model}")
-        logger.info(f"  Consultation strategy: {consultation_strategy}")
-        if consultation_strategy == "ROUTINE_ASK":
-            logger.info(f"  Routine ask interval: every {routine_ask_interval} steps")
-        logger.info(f"  Initial analysis: {'enabled' if initial_analysis else 'disabled'}")
+    # Extract reasoning strategy configuration
+    reasoning_config = config.get("reasoning_strategy", {})
+    reasoning_strategy = reasoning_config.get("strategy", None)
+    high_reasoning_first_round = reasoning_config.get("high_reasoning_first_round", 3)
+    routine_high_reasoning_interval = reasoning_config.get("routine_high_reasoning_interval", 5)
+
+    logger.info(f"Reasoning strategy: {reasoning_strategy}")
+    if reasoning_strategy:
+        logger.info(f"  - high_reasoning_first_round: {high_reasoning_first_round}")
+        logger.info(f"  - routine_high_reasoning_interval: {routine_high_reasoning_interval}")
 
     env = get_sb_environment(config, instance)
+
+    # Prepare agent configuration with reasoning strategy parameters
+    agent_config = {"mode": "yolo"} | config.get("agent", {})
+    if reasoning_strategy:
+        agent_config["reasoning_strategy"] = reasoning_strategy
+        agent_config["high_reasoning_first_round"] = high_reasoning_first_round
+        agent_config["routine_high_reasoning_interval"] = routine_high_reasoning_interval
+
     agent = InteractiveExperimentAgent(
         get_model(model_name, config.get("model", {})),
         env,
-        max_folder_depth=max_folder_depth,
-        ignored_dirs=ignored_dirs_set,
-        advanced_model_name=advanced_model,
-        consultation_strategy=consultation_strategy,
-        routine_ask_interval=routine_ask_interval,
-        initial_analysis=initial_analysis,
-        **({"mode": "yolo"} | config.get("agent", {})),
+        **agent_config,
     )
 
     exit_status, result, extra_info = None, None, None
@@ -120,7 +102,6 @@ def main(
     finally:
         save_traj(agent, output, exit_status=exit_status, result=result,
                   extra_info=extra_info)  # type: ignore[arg-type]
-        logger.info(f"Trajectory saved to {output}")
 
 
 if __name__ == "__main__":

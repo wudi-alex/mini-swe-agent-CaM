@@ -1,591 +1,353 @@
-"""Mixin for adding project folder structure rendering and advanced model consultation to agents."""
+"""Mixin for adding dynamic reasoning effort control to agents.
+Specifically adapted for LitellmResponseAPIModel.
+"""
 
-import os
 import time
-import signal
-from pathlib import Path
-from minisweagent.models import get_model
-
-
-class TimeoutError(Exception):
-    """Raised when operation times out."""
-    pass
-
-
-def timeout_handler(signum, frame):
-    raise TimeoutError("Operation timed out")
 
 
 class ExperimentMixin:
-    """Mixin that adds project folder structure rendering and advanced model consultation capability."""
+    """Mixin that adds dynamic reasoning effort control capability."""
 
     def __init__(self, *args,
-                 max_folder_depth: int = 5,
-                 ignored_dirs: set[str] = None,
-                 advanced_model_name: str = None,
-                 consultation_strategy: str = "ASK_BY_AGENT",
-                 routine_ask_interval: int = 5,
-                 initial_analysis: bool = False,
-                 advanced_model_timeout: int = 120,
+                 reasoning_strategy: str = None,
+                 high_reasoning_first_round: int = 3,
+                 routine_high_reasoning_interval: int = 5,
                  **kwargs):
         """
-        Initialize the mixin.
+        Initialize the reasoning strategy mixin.
 
         Args:
-            max_folder_depth: Maximum depth for folder structure
-            ignored_dirs: Set of directories to ignore
-            advanced_model_name: Name of advanced model to consult (e.g., 'gpt-5', 'openai/gpt-5', 'claude-opus-4')
-            consultation_strategy: Strategy for consultation - "ASK_BY_AGENT" or "ROUTINE_ASK"
-            routine_ask_interval: Interval for routine consultation (only used if strategy is ROUTINE_ASK)
-            initial_analysis: Whether to include advanced model's initial analysis in system prompt
-            advanced_model_timeout: Timeout in seconds for advanced model calls (default: 120)
+            reasoning_strategy: Strategy type - "first_high_reasoning", "routine_high_reasoning",
+                              "ask_for_high_reasoning", or None to disable
+            high_reasoning_first_round: Number of first rounds to use high reasoning
+                                      (for first_high_reasoning strategy)
+            routine_high_reasoning_interval: Interval for routine high reasoning
+                                           (for routine_high_reasoning strategy)
         """
-        # 保存自定义参数
-        self.max_folder_depth = max_folder_depth
-        self.ignored_dirs = ignored_dirs or {
-            '.git', '__pycache__', '.pytest_cache',
-            'node_modules', '.venv', 'venv', '.idea',
-            '.vscode', 'dist', 'build', '.tox', 'eggs',
-            '.eggs', '__pypackages__', '.mypy_cache',
-            '.pytest_cache', '.hypothesis', '.coverage'
-        }
-        self.advanced_model_name = advanced_model_name
-        self.advanced_model = None
-        self.consultation_strategy = consultation_strategy
-        self.routine_ask_interval = routine_ask_interval
-        self.initial_analysis = initial_analysis
-        self.consultation_count = 0  # 用于追踪咨询次数
-        self.advanced_model_timeout = advanced_model_timeout
+        self.reasoning_strategy = reasoning_strategy
+        self.high_reasoning_first_round = high_reasoning_first_round
+        self.routine_high_reasoning_interval = routine_high_reasoning_interval
+        self.next_call_use_high = False  # Flag for ask_for_high_reasoning strategy
+        self.routine_reflection_count = 0  # Counter for routine reflections
+        self._reasoning_initialized = False  # Track if we've initialized reasoning support
 
-        # 如果指定了高级模型，初始化它
-        if self.advanced_model_name:
-            try:
-                print(f"[ExperimentMixin] Initializing advanced model: {self.advanced_model_name}")
-                # 使用正确的参数名 input_model_name
-                self.advanced_model = get_model(
-                    input_model_name=self.advanced_model_name,
-                    config={}
-                )
-                print(f"[ExperimentMixin] Advanced model initialized successfully")
-                print(f"[ExperimentMixin] Model class: {type(self.advanced_model).__name__}")
-            except Exception as e:
-                print(f"[ExperimentMixin] Warning: Failed to initialize advanced model {self.advanced_model_name}")
-                print(f"[ExperimentMixin] Error: {e}")
-                import traceback
-                traceback.print_exc()
-                self.advanced_model = None
+        print(f"[ExperimentMixin] Initialized with strategy: {reasoning_strategy}")
+        if reasoning_strategy == "first_high_reasoning":
+            print(f"[ExperimentMixin] Will use high reasoning for first {high_reasoning_first_round} rounds")
+        elif reasoning_strategy == "routine_high_reasoning":
+            print(f"[ExperimentMixin] Will use high reasoning every {routine_high_reasoning_interval} rounds")
+        elif reasoning_strategy == "ask_for_high_reasoning":
+            print(f"[ExperimentMixin] Will use high reasoning when explicitly requested by agent")
 
-        # 调用父类初始化（支持多重继承）
+        # Call parent initialization (supports multiple inheritance)
         super().__init__(*args, **kwargs)
 
-    def get_folder_structure_from_env(self, root_path: str = "/testbed") -> str:
+    def _initialize_reasoning_support(self):
         """
-        从环境中获取文件夹结构（在容器内执行命令）
+        Initialize reasoning support for LitellmResponseAPIModel.
+        Creates model_kwargs attribute and patches query method.
+        """
+        if self._reasoning_initialized or not hasattr(self, 'model'):
+            return
+
+        print(f"[ExperimentMixin] Initializing reasoning support for {type(self.model).__name__}")
+
+        # Step 1: Create model_kwargs attribute if it doesn't exist
+        if not hasattr(self.model, 'model_kwargs'):
+            self.model.model_kwargs = {'reasoning': {'effort': 'low'}}
+            print(f"[ExperimentMixin] Created model.model_kwargs attribute")
+        else:
+            print(f"[ExperimentMixin] model.model_kwargs already exists")
+            # Ensure reasoning key exists
+            if 'reasoning' not in self.model.model_kwargs:
+                self.model.model_kwargs['reasoning'] = {'effort': 'low'}
+
+        # Step 2: Patch the query method to inject reasoning config
+        if not hasattr(self.model, '_original_query'):
+            self.model._original_query = self.model.query
+
+            def query_with_reasoning(messages, **kwargs):
+                """
+                Patched query method that injects reasoning configuration.
+                """
+                # Get current reasoning config from model_kwargs
+                if hasattr(self.model, 'model_kwargs') and 'reasoning' in self.model.model_kwargs:
+                    reasoning_config = self.model.model_kwargs['reasoning']
+
+                    # Inject into kwargs
+                    if 'reasoning' not in kwargs:
+                        kwargs['reasoning'] = {}
+                    kwargs['reasoning'].update(reasoning_config)
+
+                    effort = reasoning_config.get('effort', 'unknown')
+                    print(f"[ExperimentMixin] Injecting reasoning effort: {effort}")
+
+                # Call original query method
+                return self.model._original_query(messages, **kwargs)
+
+            # Replace the query method
+            self.model.query = query_with_reasoning
+            print(f"[ExperimentMixin] Successfully patched query method")
+
+        self._reasoning_initialized = True
+        print(f"[ExperimentMixin] Reasoning support initialized successfully")
+
+    def set_reasoning_effort(self, effort: str):
+        """
+        Set the reasoning effort level for the model.
 
         Args:
-            root_path: 根目录路径（通常是 /testbed）
+            effort: "low", "medium", or "high"
+        """
+        if not hasattr(self, 'model'):
+            print(f"[ExperimentMixin] Warning: Model not initialized yet")
+            return
+
+        # Ensure initialization is done
+        self._initialize_reasoning_support()
+
+        # Now we can safely set the reasoning effort
+        if hasattr(self.model, 'model_kwargs'):
+            old_effort = self.model.model_kwargs.get('reasoning', {}).get('effort', 'unknown')
+            self.model.model_kwargs['reasoning']['effort'] = effort
+            print(f"[ExperimentMixin] Reasoning effort: {old_effort} -> {effort}")
+        else:
+            print(f"[ExperimentMixin] ERROR: model_kwargs still not available after initialization")
+
+    def get_current_reasoning_effort(self) -> str:
+        """Get the current reasoning effort level."""
+        if not hasattr(self, 'model'):
+            return "unknown"
+
+        if hasattr(self.model, 'model_kwargs'):
+            return self.model.model_kwargs.get('reasoning', {}).get('effort', 'unknown')
+
+        return "unknown"
+
+    def should_use_high_reasoning_first_round(self) -> bool:
+        """
+        Check if high reasoning should be used based on first_high_reasoning strategy.
 
         Returns:
-            格式化的文件夹结构字符串
+            True if current call is within the first N rounds
         """
-        print(f"[ExperimentMixin] Getting folder structure from: {root_path}")
+        if self.reasoning_strategy != "first_high_reasoning":
+            return False
 
-        # 构建 bash 脚本来获取目录结构
-        bash_script = f"""
-#!/bin/bash
+        # Check if we're still in the first N rounds
+        current_calls = getattr(self.model, 'n_calls', 0)
+        return current_calls < self.high_reasoning_first_round
 
-# 函数：生成树形结构
-print_tree() {{
-    local prefix="$1"
-    local dir="$2"
-    local depth="$3"
-    local max_depth={self.max_folder_depth}
-    
-    # 如果达到最大深度，返回
-    if [ "$depth" -ge "$max_depth" ]; then
-        return
-    fi
-    
-    # 获取所有子目录（排序，排除忽略的目录）
-    local subdirs=()
-    while IFS= read -r -d '' subdir; do
-        local basename=$(basename "$subdir")
-        # 检查是否在忽略列表中
-        local should_ignore=0
-        for ignored in {' '.join(self.ignored_dirs)}; do
-            if [ "$basename" = "$ignored" ]; then
-                should_ignore=1
-                break
-            fi
-        done
-        if [ "$should_ignore" -eq 0 ]; then
-            subdirs+=("$subdir")
-        fi
-    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
-    
-    local count=${{#subdirs[@]}}
-    local index=0
-    
-    for subdir in "${{subdirs[@]}}"; do
-        local basename=$(basename "$subdir")
-        index=$((index + 1))
-        
-        if [ "$index" -eq "$count" ]; then
-            echo "${{prefix}}└── $basename/"
-            print_tree "${{prefix}}    " "$subdir" $((depth + 1))
-        else
-            echo "${{prefix}}├── $basename/"
-            print_tree "${{prefix}}│   " "$subdir" $((depth + 1))
-        fi
-    done
-}}
+    def should_use_high_reasoning_routine(self) -> bool:
+        """
+        Check if high reasoning should be used based on routine_high_reasoning strategy.
 
-# 检查目录是否存在
-if [ ! -d "{root_path}" ]; then
-    echo "Path does not exist: {root_path}"
-    exit 1
-fi
+        Returns:
+            True if we've reached the interval for routine high reasoning
+        """
+        if self.reasoning_strategy != "routine_high_reasoning":
+            return False
 
-# 打印根目录
-echo "$(basename {root_path})/"
+        current_calls = getattr(self.model, 'n_calls', 0)
 
-# 打印树形结构
-print_tree "" "{root_path}" 0
+        # Check if we're at the interval point (but not at call 0)
+        if current_calls > 0 and current_calls % self.routine_high_reasoning_interval == 0:
+            return True
+
+        return False
+
+    def check_high_reasoning_request(self, output: dict) -> bool:
+        """
+        Check if output contains a request for high reasoning.
+
+        Args:
+            output: Command execution output
+
+        Returns:
+            True if agent requested high reasoning
+        """
+        if self.reasoning_strategy != "ask_for_high_reasoning":
+            return False
+
+        output_text = output.get("output", "")
+        lines = output_text.lstrip().splitlines()
+
+        # Check if first line is the high reasoning request
+        if lines and lines[0].strip() == "ASK_FOR_HIGH_REASONING":
+            print(f"[ExperimentMixin] Agent requested high reasoning")
+            return True
+
+        return False
+
+    def prepare_for_next_call(self):
+        """Prepare reasoning effort for the next model call based on active strategy."""
+
+        # Strategy 1: first_high_reasoning
+        if self.reasoning_strategy == "first_high_reasoning":
+            if self.should_use_high_reasoning_first_round():
+                self.set_reasoning_effort("high")
+                current_calls = getattr(self.model, 'n_calls', 0)
+                print(f"[ExperimentMixin] Using high reasoning (round {current_calls + 1}/{self.high_reasoning_first_round})")
+            else:
+                current_effort = self.get_current_reasoning_effort()
+                if current_effort != "low":
+                    self.set_reasoning_effort("low")
+                    print(f"[ExperimentMixin] Switched to low reasoning after first {self.high_reasoning_first_round} rounds")
+
+        # Strategy 3: ask_for_high_reasoning (check flag set by execute_action)
+        elif self.reasoning_strategy == "ask_for_high_reasoning":
+            if self.next_call_use_high:
+                self.set_reasoning_effort("high")
+                print(f"[ExperimentMixin] Using high reasoning for this call (agent requested)")
+                self.next_call_use_high = False  # Reset flag
+            else:
+                current_effort = self.get_current_reasoning_effort()
+                if current_effort != "low":
+                    self.set_reasoning_effort("low")
+
+    def inject_routine_reflection(self):
+        """Inject a reflection prompt for routine high reasoning strategy."""
+        self.routine_reflection_count += 1
+
+        reflection_prompt = f"""
+<routine_reflection checkpoint="{self.routine_reflection_count}" step="{self.model.n_calls}">
+This is a routine checkpoint (every {self.routine_high_reasoning_interval} steps). Please take a moment to:
+
+1. **Review your progress**: What have you accomplished so far?
+2. **Identify issues**: Are there any mistakes or problems in your approach?
+3. **Verify correctness**: Have you tested your changes? Are they working as expected?
+4. **Plan next steps**: What should you do next to complete the task?
+5. **Course correction**: If you're stuck or going in the wrong direction, what should you change?
+
+Think deeply about your trajectory and make any necessary corrections before proceeding.
+</routine_reflection>
 """
 
-        try:
-            # 在环境中执行命令获取文件夹结构
-            result = self.env.execute(bash_script)
+        print("="*80)
+        print(f"[ExperimentMixin] Routine Reflection #{self.routine_reflection_count}")
+        print(f"[ExperimentMixin] Step: {self.model.n_calls}")
+        print("="*80)
 
-            if result.get("returncode", 1) == 0:
-                output = result.get("output", "")
-                if output:
-                    print(f"[ExperimentMixin] Folder structure retrieved: {len(output)} characters")
-                    return output.strip()
-                else:
-                    print("[ExperimentMixin] Warning: Empty output from folder structure command")
-                    return f"Empty output from folder structure command"
-            else:
-                print("[ExperimentMixin] Folder structure script failed, trying simple find command")
-                # 如果脚本失败，使用简单的 find 命令作为备用
-                simple_cmd = f"find {root_path} -type d -not -path '*/.git/*' -not -path '*/__pycache__/*' -not -path '*/node_modules/*' | head -200 | sort"
-                result = self.env.execute(simple_cmd)
-                if result.get("returncode", 1) == 0:
-                    return f"Simplified folder list:\n{result.get('output', '').strip()}"
-                else:
-                    return f"Failed to get folder structure: {result.get('output', 'unknown error')}"
-        except Exception as e:
-            print(f"[ExperimentMixin] Error getting folder structure: {e}")
-            import traceback
-            traceback.print_exc()
-            return f"Error getting folder structure: {str(e)}"
+        # Add reflection message to conversation
+        self.add_message("user", reflection_prompt)
 
-    def call_advanced_model_with_timeout(self, messages: list[dict], timeout: int = None) -> dict:
+        # Set high reasoning for the next call
+        self.set_reasoning_effort("high")
+        print(f"[ExperimentMixin] High reasoning enabled for reflection response")
+
+    def get_high_reasoning_instruction(self) -> str:
         """
-        调用高级模型，带超时机制
-
-        Args:
-            messages: 消息列表
-            timeout: 超时时间（秒），如果为 None 则使用默认值
+        Get instruction text for requesting high reasoning (for ask_for_high_reasoning strategy).
 
         Returns:
-            响应字典
+            Instruction text to append to system prompt or task description
         """
-        if timeout is None:
-            timeout = self.advanced_model_timeout
-
-        print(f"[ExperimentMixin] Calling advanced model with {timeout}s timeout...")
-        print(f"[ExperimentMixin] Messages count: {len(messages)}")
-
-        # 计算总字符数
-        total_chars = sum(len(str(m.get('content', ''))) for m in messages)
-        print(f"[ExperimentMixin] Total message content: {total_chars} characters")
-
-        result = {'response': None, 'error': None}
-
-        def query_model():
-            try:
-                print(f"[ExperimentMixin] Starting query to {self.advanced_model_name}...")
-                print(messages)
-                result['response'] = self.advanced_model.query(messages)
-                print(f"[ExperimentMixin] Query completed successfully")
-            except Exception as e:
-                print(f"[ExperimentMixin] Query failed with error: {e}")
-                result['error'] = e
-
-        import threading
-        thread = threading.Thread(target=query_model)
-        thread.daemon = True
-        thread.start()
-
-        # 等待线程完成或超时
-        thread.join(timeout=timeout)
-
-        if thread.is_alive():
-            # 超时了
-            print(f"[ExperimentMixin] WARNING: Advanced model call timed out after {timeout}s")
-            print(f"[ExperimentMixin] This usually indicates network issues or API problems")
-            raise TimeoutError(f"Advanced model call timed out after {timeout} seconds")
-
-        if result['error']:
-            raise result['error']
-
-        if result['response'] is None:
-            raise Exception("No response received from advanced model")
-
-        return result['response']
-
-    def get_initial_analysis(self, task: str, folder_structure: str) -> str:
-        """
-        获取高级模型对任务的初始分析和步骤指导
-
-        Args:
-            task: 任务描述
-            folder_structure: 项目文件夹结构
-
-        Returns:
-            高级模型的初始分析
-        """
-        if not self.advanced_model:
-            print("[ExperimentMixin] No advanced model available for initial analysis")
+        if self.reasoning_strategy != "ask_for_high_reasoning":
             return ""
 
-        print("[ExperimentMixin] Requesting initial analysis from advanced model...")
-        print(f"[ExperimentMixin] Task length: {len(task)} characters")
-        print(f"[ExperimentMixin] Folder structure length: {len(folder_structure)} characters")
+        instruction = """
 
-        try:
-            initial_prompt = f"""# Initial Task Analysis Request
+## High Reasoning Request
+When you encounter a particularly challenging problem that requires deep analysis, careful planning, or complex reasoning, you can request enhanced reasoning capabilities. To do this, use the following bash command:
 
-You are an expert software engineer. Please analyze the following task and provide detailed guidance.
+```bash
+echo "ASK_FOR_HIGH_REASONING"
+```
 
-## Task Description:
-{task}
+After executing this command, your next response will be generated with high reasoning effort, allowing for more thorough analysis and better problem-solving. Use this judiciously when you:
+- Need to analyze complex code interactions
+- Are stuck and need to reconsider your approach
+- Need to plan a multi-step solution carefully
+- Are about to make critical changes that require careful thought
 
-## Project Folder Structure:
-{folder_structure}
+Remember: High reasoning consumes more resources, so only request it when truly necessary."""
 
-## Your Task:
-Please provide:
-1. **Problem Analysis**: What is the core issue that needs to be fixed?
-2. **Key Files**: Which files are likely to need modification?
-3. **Approach**: What is the recommended approach to solve this issue?
-4. **Step-by-Step Plan**: Provide a high-level plan with 3-5 concrete steps
-5. **Potential Pitfalls**: What are common mistakes to avoid?
-
-Please be specific and actionable in your guidance."""
-
-            consultation_messages = [
-                {
-                    "role": "system",
-                    "content": "You are an expert software engineer providing initial guidance for a coding task.",
-                    "timestamp": time.time()
-                },
-                {
-                    "role": "user",
-                    "content": initial_prompt,
-                    "timestamp": time.time()
-                }
-            ]
-
-            print(f"[ExperimentMixin] Prepared {len(consultation_messages)} messages for advanced model")
-            start_time = time.time()
-
-            # 记录调用前的 cost
-            cost_before = self.advanced_model.cost if hasattr(self.advanced_model, 'cost') else 0
-            print(f"[ExperimentMixin] Cost before call: ${cost_before:.4f}")
-
-            # 使用带超时的调用
-            try:
-                response = self.call_advanced_model_with_timeout(consultation_messages)
-            except TimeoutError as e:
-                print(f"[ExperimentMixin] Initial analysis timed out: {e}")
-                return f"Initial analysis request timed out. Please check your network connection and API access."
-
-            elapsed = time.time() - start_time
-            print(f"[ExperimentMixin] Advanced model responded in {elapsed:.2f}s")
-
-            # 记录调用后的 cost 并累加到主模型
-            cost_after = self.advanced_model.cost if hasattr(self.advanced_model, 'cost') else 0
-            advanced_cost = cost_after - cost_before
-            print(f"[ExperimentMixin] Cost after call: ${cost_after:.4f}")
-
-            # 将高级模型的 cost 累加到主模型
-            if hasattr(self.model, 'cost'):
-                self.model.cost += advanced_cost
-                print(f"[ExperimentMixin] Advanced model cost for initial analysis: ${advanced_cost:.4f}")
-                print(f"[ExperimentMixin] Total cost so far: ${self.model.cost:.4f}")
-
-            content = response.get("content", "")
-            print(f"[ExperimentMixin] Initial analysis received: {len(content)} characters")
-            return content
-
-        except Exception as e:
-            print(f"[ExperimentMixin] Error getting initial analysis: {e}")
-            import traceback
-            traceback.print_exc()
-            return f"Error getting initial analysis: {str(e)}"
-
-    def consult_advanced_model(self, consultation_type: str = "on_demand") -> str:
-        """
-        咨询高级模型以获取建议
-
-        Args:
-            consultation_type: 咨询类型 - "on_demand" 或 "routine"
-
-        Returns:
-            高级模型的回复
-        """
-        if not self.advanced_model:
-            return "Advanced model is not configured. Please specify 'advanced_model_name' parameter."
-
-        print(f"[ExperimentMixin] Consulting advanced model (type: {consultation_type})...")
-
-        try:
-            # 构建发送给高级模型的上下文
-            consultation_prompt = self._build_consultation_context(consultation_type)
-
-            # 创建临时消息列表用于咨询
-            consultation_messages = [
-                {
-                    "role": "system",
-                    "content": "You are an expert software engineer consultant. Another AI agent is working on a coding task and has requested your help. Review the conversation history and provide specific, actionable advice."
-                },
-                {
-                    "role": "user",
-                    "content": consultation_prompt
-                }
-            ]
-
-            print(f"[ExperimentMixin] Prepared {len(consultation_messages)} messages for advanced model")
-            start_time = time.time()
-
-            # 记录调用前的 cost
-            cost_before = self.advanced_model.cost if hasattr(self.advanced_model, 'cost') else 0
-
-            # 使用带超时的调用
-            try:
-                response = self.call_advanced_model_with_timeout(consultation_messages)
-            except TimeoutError as e:
-                print(f"[ExperimentMixin] Consultation timed out: {e}")
-                return f"Consultation request timed out. Please check your network connection and API access."
-
-            elapsed = time.time() - start_time
-            print(f"[ExperimentMixin] Advanced model responded in {elapsed:.2f}s")
-
-            # 记录调用后的 cost 并累加到主模型
-            cost_after = self.advanced_model.cost if hasattr(self.advanced_model, 'cost') else 0
-            advanced_cost = cost_after - cost_before
-
-            # 将高级模型的 cost 累加到主模型
-            if hasattr(self.model, 'cost'):
-                self.model.cost += advanced_cost
-                print(f"[ExperimentMixin] Advanced model consultation cost: ${advanced_cost:.4f}")
-                print(f"[ExperimentMixin] Total accumulated cost: ${self.model.cost:.4f}")
-
-            self.consultation_count += 1
-            content = response.get("content", "No response from advanced model")
-            print(f"[ExperimentMixin] Consultation response received: {len(content)} characters")
-            return content
-
-        except Exception as e:
-            print(f"[ExperimentMixin] Error consulting advanced model: {e}")
-            import traceback
-            traceback.print_exc()
-            return f"Error consulting advanced model: {str(e)}"
-
-    def _build_consultation_context(self, consultation_type: str) -> str:
-        """
-        构建发送给高级模型的上下文
-
-        Args:
-            consultation_type: 咨询类型
-
-        Returns:
-            格式化的上下文字符串
-        """
-        context_parts = []
-
-        if consultation_type == "routine":
-            context_parts.append("# Routine Progress Check\n")
-            context_parts.append(f"This is routine consultation #{self.consultation_count + 1}. ")
-            context_parts.append("The agent has been working for a while and we're checking progress.\n")
-        else:
-            context_parts.append("# Agent Consultation Request\n")
-            context_parts.append("The AI agent has explicitly requested help.\n")
-
-        context_parts.append("\n## Conversation History:\n")
-
-        # 包含最近的对话历史（过滤掉系统消息以减少 token 使用）
-        for msg in self.messages[-20:]:  # 只包含最近 20 条消息
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-
-            # 截断过长的内容
-            if len(content) > 2000:
-                content = content[:1000] + "\n... [truncated] ...\n" + content[-1000:]
-
-            context_parts.append(f"\n### {role.upper()}:\n{content}\n")
-
-        context_parts.append("\n## Your Task:\n")
-        if consultation_type == "routine":
-            context_parts.append("Please provide:\n")
-            context_parts.append("1. Assessment of current progress\n")
-            context_parts.append("2. Evaluation of the agent's approach so far\n")
-            context_parts.append("3. Suggestions for improvement or course correction if needed\n")
-            context_parts.append("4. Encouragement if on the right track, or redirection if stuck\n")
-        else:
-            context_parts.append("Please provide:\n")
-            context_parts.append("1. Analysis of what the agent has tried so far\n")
-            context_parts.append("2. Identification of any mistakes or issues\n")
-            context_parts.append("3. Specific suggestions for the next steps\n")
-            context_parts.append("4. Any insights about the problem that might help\n")
-
-        return "".join(context_parts)
-
-    def check_advanced_model_request(self, output: dict[str, str]) -> bool:
-        """
-        检查输出是否包含高级模型咨询请求
-
-        Args:
-            output: 命令执行的输出
-
-        Returns:
-            是否请求高级模型咨询
-        """
-        lines = output.get("output", "").lstrip().splitlines()
-        if lines and lines[0].strip() == "ASK_ADVANCED_MODEL_FOR_HELP":
-            return True
-        return False
-
-    def should_routine_consult(self) -> bool:
-        """
-        检查是否应该进行周期性咨询
-
-        Returns:
-            是否应该咨询
-        """
-        if self.consultation_strategy != "ROUTINE_ASK":
-            return False
-
-        if not self.advanced_model:
-            return False
-
-        # 检查是否到达咨询间隔
-        if self.model.n_calls > 0 and self.model.n_calls % self.routine_ask_interval == 0:
-            return True
-
-        return False
+        return instruction
 
     def execute_action(self, action: dict) -> dict:
-        """重写 execute_action 以检查高级模型咨询请求"""
-        # 调用父类的 execute_action
+        """Override execute_action to handle ask_for_high_reasoning strategy."""
+
+        # Call parent's execute_action
         output = super().execute_action(action)
 
-        # 策略1: ASK_BY_AGENT - 检查 agent 主动请求
-        if self.consultation_strategy == "ASK_BY_AGENT":
-            if self.check_advanced_model_request(output):
-                print("="*80)
-                print("[ExperimentMixin] Advanced Model Consultation (On-Demand)")
-                print("="*80)
+        # Strategy 3: Check if agent requested high reasoning
+        if self.check_high_reasoning_request(output):
+            print("="*80)
+            print("[ExperimentMixin] High Reasoning Request Detected")
+            print("="*80)
 
-                # 咨询高级模型
-                advice = self.consult_advanced_model(consultation_type="on_demand")
+            # Set flag to use high reasoning for the next call
+            self.next_call_use_high = True
 
-                # 构建咨询响应消息
-                consultation_response = f"""
-<advanced_model_consultation type="on_demand">
-You requested help from an advanced model. Here is the response:
-
-{advice}
-
-Please carefully consider this advice and proceed with your next action.
-</advanced_model_consultation>
+            # Add acknowledgment message
+            acknowledgment = """
+<high_reasoning_acknowledgment>
+Your request for high reasoning has been received. The next model call will use high reasoning effort to provide more thorough analysis.
+</high_reasoning_acknowledgment>
 """
-                # 将高级模型的建议作为 user 消息添加到对话中
-                self.add_message("user", consultation_response)
-
-                # 记录咨询事件
-                print(f"[ExperimentMixin] Consultation #{self.consultation_count} completed")
-                print(f"[ExperimentMixin] Advice preview: {advice[:200]}...")
-                print("="*80)
+            self.add_message("user", acknowledgment)
+            print("[ExperimentMixin] High reasoning will be used for the next call")
+            print("="*80)
 
         return output
 
     def step(self) -> dict:
-        """重写 step 以支持周期性咨询"""
-        # 策略2: ROUTINE_ASK - 周期性咨询
-        if self.should_routine_consult():
-            print("="*80)
-            print(f"[ExperimentMixin] Advanced Model Consultation (Routine #{self.consultation_count + 1})")
-            print(f"[ExperimentMixin] Step: {self.model.n_calls}")
-            print("="*80)
+        """Override step to handle strategy logic before each step."""
 
-            # 咨询高级模型
-            advice = self.consult_advanced_model(consultation_type="routine")
+        # Strategy 2: routine_high_reasoning - check if we should inject reflection
+        if self.should_use_high_reasoning_routine():
+            self.inject_routine_reflection()
+            # Note: After reflection message is added, parent's step() will be called
+            # which will trigger a model call with high reasoning
 
-            # 构建咨询响应消息
-            consultation_response = f"""
-<advanced_model_consultation type="routine" step="{self.model.n_calls}">
-Regular progress check from advanced model (every {self.routine_ask_interval} steps):
+        # Prepare reasoning effort for the next call (for strategies 1 and 3)
+        self.prepare_for_next_call()
 
-{advice}
+        # Call parent's step
+        result = super().step()
 
-Continue with your work, taking this feedback into account.
-</advanced_model_consultation>
-"""
-            # 将高级模型的建议作为 user 消息添加到对话中
-            self.add_message("user", consultation_response)
+        # After the step, if we used high reasoning for routine strategy, reset to low
+        if self.reasoning_strategy == "routine_high_reasoning":
+            current_calls = getattr(self.model, 'n_calls', 0)
+            # Check if we just completed a routine high reasoning call
+            if (current_calls - 1) > 0 and (current_calls - 1) % self.routine_high_reasoning_interval == 0:
+                self.set_reasoning_effort("low")
+                print(f"[ExperimentMixin] Reset to low reasoning after routine reflection")
 
-            # 记录咨询事件
-            print(f"[ExperimentMixin] Routine consultation #{self.consultation_count} completed")
-            print(f"[ExperimentMixin] Advice preview: {advice[:200]}...")
-            print("="*80)
-
-        # 调用父类的 step
-        return super().step()
+        return result
 
     def run(self, task: str, **kwargs) -> tuple[str, str]:
-        """重写 run 方法，在执行前添加项目结构和可选的初始分析"""
+        """Override run to initialize reasoning strategy at the start."""
 
         print("="*80)
         print("[ExperimentMixin] Starting run with ExperimentMixin")
+        print(f"[ExperimentMixin] Active strategy: {self.reasoning_strategy}")
         print("="*80)
 
-        # 获取工作目录（Docker 容器中通常是 /testbed）
-        working_dir = getattr(self.env, 'cwd', '/testbed')
-        print(f"[ExperimentMixin] Working directory: {working_dir}")
+        # Initialize reasoning support (creates model_kwargs and patches query)
+        if hasattr(self, 'model'):
+            self._initialize_reasoning_support()
+            print(f"[ExperimentMixin] Model type: {type(self.model).__name__}")
+            print(f"[ExperimentMixin] Initial reasoning effort: {self.get_current_reasoning_effort()}")
 
-        # 从环境（容器内）获取文件夹结构
-        folder_structure = self.get_folder_structure_from_env(working_dir)
+        # Initialize reasoning effort based on strategy
+        if self.reasoning_strategy == "first_high_reasoning":
+            # Start with high reasoning
+            self.set_reasoning_effort("high")
+            print(f"[ExperimentMixin] Starting with high reasoning for first {self.high_reasoning_first_round} rounds")
+        elif self.reasoning_strategy in ["routine_high_reasoning", "ask_for_high_reasoning"]:
+            # Start with low reasoning (will be changed as needed)
+            self.set_reasoning_effort("low")
+            print(f"[ExperimentMixin] Starting with low reasoning")
 
-        # 添加到 extra_template_vars
-        self.extra_template_vars['project_folders'] = folder_structure
-        print(f"[ExperimentMixin] Folder structure added to template vars")
+        # For ask_for_high_reasoning strategy, append instruction to task
+        if self.reasoning_strategy == "ask_for_high_reasoning":
+            high_reasoning_instruction = self.get_high_reasoning_instruction()
+            if high_reasoning_instruction:
+                task = task + high_reasoning_instruction
+                print(f"[ExperimentMixin] Appended high reasoning instruction to task")
 
-        # 如果启用了初始分析，获取高级模型的分析
-        if self.initial_analysis and self.advanced_model:
-            print("="*80)
-            print("[ExperimentMixin] Getting Initial Analysis from Advanced Model")
-            print("="*80)
+        print("="*80)
 
-            try:
-                initial_analysis = self.get_initial_analysis(task, folder_structure)
-                self.extra_template_vars['initial_analysis'] = initial_analysis
-
-                print(f"[ExperimentMixin] Initial analysis received and added to template vars")
-                print("="*80)
-            except Exception as e:
-                print(f"[ExperimentMixin] Failed to get initial analysis: {e}")
-                import traceback
-                traceback.print_exc()
-                self.extra_template_vars['initial_analysis'] = ""
-                print("[ExperimentMixin] Continuing without initial analysis...")
-        else:
-            self.extra_template_vars['initial_analysis'] = ""
-            if self.initial_analysis:
-                print("[ExperimentMixin] Initial analysis requested but no advanced model available")
-
-        print("[ExperimentMixin] Starting parent run method...")
-        # 调用父类的 run 方法
+        # Call parent's run method
         return super().run(task, **kwargs)
