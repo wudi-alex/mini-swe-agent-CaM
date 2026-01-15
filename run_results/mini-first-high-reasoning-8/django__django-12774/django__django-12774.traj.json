@@ -1,10 +1,10 @@
 {
   "info": {
     "exit_status": "Submitted",
-    "submission": "diff --git a/django/db/models/query.py b/django/db/models/query.py\nindex d9c9b0db04..a780a6ca20 100644\n--- a/django/db/models/query.py\n+++ b/django/db/models/query.py\n@@ -15,7 +15,7 @@ from django.db import (\n     DJANGO_VERSION_PICKLE_KEY, IntegrityError, NotSupportedError, connections,\n     router, transaction,\n )\n-from django.db.models import AutoField, DateField, DateTimeField, sql\n+from django.db.models import AutoField, DateField, DateTimeField, UniqueConstraint, sql\n from django.db.models.constants import LOOKUP_SEP\n from django.db.models.deletion import Collector\n from django.db.models.expressions import Case, Expression, F, Value, When\n@@ -689,8 +689,15 @@ class QuerySet:\n         \"\"\"\n         assert not self.query.is_sliced, \\\n             \"Cannot use 'limit' or 'offset' with in_bulk\"\n-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n-            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+        if field_name != 'pk':\n+            field = self.model._meta.get_field(field_name)\n+            if not field.unique:\n+                # The field may be unique due to a UniqueConstraint in the model's Meta.constraints.\n+                for constraint in getattr(self.model._meta, 'constraints', ()): \n+                    if isinstance(constraint, UniqueConstraint) and list(getattr(constraint, 'fields', [])) == [field_name]:\n+                        break\n+                else:\n+                    raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n         if id_list is not None:\n             if not id_list:\n                 return {}\ndiff --git a/test_app/__init__.py b/test_app/__init__.py\nnew file mode 100644\nindex 0000000000..88bb5df0fc\n--- /dev/null\n+++ b/test_app/__init__.py\n@@ -0,0 +1 @@\n+default_app_config = 'test_app.apps.TestAppConfig'\ndiff --git a/test_app/apps.py b/test_app/apps.py\nnew file mode 100644\nindex 0000000000..05dd1f6e21\n--- /dev/null\n+++ b/test_app/apps.py\n@@ -0,0 +1,5 @@\n+from django.apps import AppConfig\n+\n+class TestAppConfig(AppConfig):\n+    name = 'test_app'\n+    label = 'test_app'\ndiff --git a/test_in_bulk.py b/test_in_bulk.py\nnew file mode 100644\nindex 0000000000..1e47097b7c\n--- /dev/null\n+++ b/test_in_bulk.py\n@@ -0,0 +1,38 @@\n+import os\n+import django\n+from django.conf import settings\n+from django.db import models\n+\n+BASE_DIR = os.path.dirname(__file__)\n+if not settings.configured:\n+    settings.configure(\n+        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+        INSTALLED_APPS=['test_app'],\n+        SECRET_KEY='test',\n+    )\n+\n+# Create a minimal app config\n+import types\n+apps = types.SimpleNamespace()\n+django.setup()\n+\n+class Article(models.Model):\n+    slug = models.CharField(max_length=255)\n+\n+    class Meta:\n+        app_label = 'test_app'\n+        constraints = [\n+            models.UniqueConstraint(fields=['slug'], name='testapp_article_slug_unq')\n+        ]\n+\n+# Create tables\n+from django.db import connection\n+with connection.schema_editor() as editor:\n+    editor.create_model(Article)\n+\n+# Create some objects\n+Article.objects.create(slug='a')\n+Article.objects.create(slug='b')\n+\n+# Call in_bulk by slug\n+print(Article.objects.in_bulk(field_name='slug'))\n",
+    "submission": "diff --git a/django/db/models/query.py b/django/db/models/query.py\nindex d9c9b0db04..16cb10cf64 100644\n--- a/django/db/models/query.py\n+++ b/django/db/models/query.py\n@@ -689,8 +689,22 @@ class QuerySet:\n         \"\"\"\n         assert not self.query.is_sliced, \\\n             \"Cannot use 'limit' or 'offset' with in_bulk\"\n-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n-            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+        if field_name != 'pk':\n+            field = self.model._meta.get_field(field_name)\n+            is_unique = field.unique\n+            # Consider a field unique if there's an unconditional UniqueConstraint on it.\n+            if not is_unique:\n+                try:\n+                    from django.db.models import UniqueConstraint\n+                except Exception:\n+                    UniqueConstraint = None\n+                if UniqueConstraint is not None:\n+                    for constraint in self.model._meta.constraints:\n+                        if isinstance(constraint, UniqueConstraint) and constraint.condition is None and tuple(constraint.fields) == (field_name,):\n+                            is_unique = True\n+                            break\n+            if not is_unique:\n+                raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n         if id_list is not None:\n             if not id_list:\n                 return {}\n",
     "model_stats": {
-      "instance_cost": 0.025375500000000002,
-      "api_calls": 9
+      "instance_cost": 0.0152928,
+      "api_calls": 13
     },
     "mini_version": "1.17.3",
     "config": {
@@ -60,21 +60,21 @@
     {
       "role": "system",
       "content": "You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.\nYour response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).\n\nInclude a THOUGHT section before your command where you explain your reasoning process.\nFormat your response as shown in <format_example>.\n\n<format_example>\nTHOUGHT: Your reasoning and analysis here\n\n```bash\nyour_command_here\n```\n</format_example>\n\nFailure to follow these rules will cause your response to be rejected.",
-      "timestamp": 1768459067.815707
+      "timestamp": 1768469813.1102517
     },
     {
       "role": "user",
       "content": "<pr_description>\nConsider the following PR description:\nAllow QuerySet.in_bulk() for fields with total UniqueConstraints.\nDescription\n\t\nIf a field is unique by UniqueConstraint instead of unique=True running in_bulk() on that field will fail.\nConsider:\nclass Article(models.Model):\n\tslug = models.CharField(max_length=255)\n\t\n\tclass Meta:\n\t\tconstraints = [\n\t\t\tmodels.UniqueConstraint(fields=[\"slug\"], name=\"%(app_label)s_%(class)s_slug_unq\")\n\t\t]\n>>> Article.objects.in_bulk(field_name=\"slug\")\nTraceback (most recent call last):\n File \"/usr/local/lib/python3.8/code.py\", line 90, in runcode\n\texec(code, self.locals)\n File \"<console>\", line 1, in <module>\n File \"/app/venv/lib/python3.8/site-packages/django/db/models/manager.py\", line 82, in manager_method\n\treturn getattr(self.get_queryset(), name)(*args, **kwargs)\n File \"/app/venv/lib/python3.8/site-packages/django/db/models/query.py\", line 680, in in_bulk\n\traise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\nValueError: in_bulk()'s field_name must be a unique field but 'slug' isn't.\nIt should be pretty simple to fix this and I have a patch if accepted.\n\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting commands.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\nFor each response:\n1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish\n2. Provide exactly ONE bash command to execute\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)\n\n## Recommended Workflow\n1. Analyze the codebase by finding and reading relevant files\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Test edge cases to ensure your fix is robust\n\n## Command Execution Rules\nYou are operating in an environment where\n1. You write a single command\n2. The system executes that command in a subshell\n3. You see the result\n4. You write your next command\n\nEach response should include:\n1. A **THOUGHT** section where you explain your reasoning and plan\n2. A single bash code block with your command\n\nFormat your responses like this:\n\n<format_example>\nTHOUGHT: Here I explain my reasoning process, analysis of the current situation,\nand what I'm trying to accomplish with the command below.\n\n```bash\nyour_command_here\n```\n</format_example>\n\nCommands must be specified in a single bash code block:\n\n```bash\nyour_command_here\n```\n\n**CRITICAL REQUIREMENTS:**\n- Your response SHOULD include a THOUGHT section explaining your reasoning\n- Your response MUST include EXACTLY ONE bash code block\n- This bash block MUST contain EXACTLY ONE command (or a set of commands connected with && or ||)\n- If you include zero or multiple bash blocks, or no command at all, YOUR RESPONSE WILL FAIL\n- Do NOT try to run multiple independent commands in separate blocks in one response\n- Directory or environment variable changes are not persistent. Every action is executed in a new subshell.\n- However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files\n\nExample of a CORRECT response:\n<example_response>\nTHOUGHT: I need to understand the structure of the repository first. Let me check what files are in the current directory to get a better understanding of the codebase.\n\n```bash\nls -la\n```\n</example_response>\n\nExample of an INCORRECT response:\n<example_response>\nTHOUGHT: I need to examine the codebase and then look at a specific file. I'll run multiple commands to do this.\n\n```bash\nls -la\n```\n\nNow I'll read the file:\n\n```bash\ncat file.txt\n```\n</example_response>\n\nIf you need to run multiple commands, either:\n1. Combine them in one block using && or ||\n```bash\ncommand1 && command2 || echo \"Error occurred\"\n```\n\n2. Wait for the first command to complete, see its output, then issue the next command in your following response.\n\n## Environment Details\n- You have a full Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n- If a command isn't available, you can install it\n\n## Useful Command Examples\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.py\nimport numpy as np\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\n### Any other command you want to run\n```bash\nanything\n```\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following command:\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```\n\nThis command will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>",
-      "timestamp": 1768459067.816706
+      "timestamp": 1768469813.111255
     },
     {
       "role": "assistant",
-      "content": "THOUGHT: I will list the repository contents to find the project structure and locate the relevant source files under the testbed directory to inspect where the in_bulk uniqueness check might be implemented.\n\n```bash\nls -la\n```",
-      "timestamp": 1768459071.786297,
+      "content": "THOUGHT: I need to inspect the repository to find the Django-like QuerySet implementation and tests that reference in_bulk behavior. I'll list files at the top level to locate relevant modules to modify.\n\n```bash\nls -la\n```",
+      "timestamp": 1768469816.2637131,
       "extra": {
         "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiM2JjNzVjODE5OTliYWVjNjFhMTZhNzY0MTE=",
-          "created_at": 1768459067,
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1MzUwZDA4ODE5NmFlZDk1ZDIyNDc5OTUyODI=",
+          "created_at": 1768469813,
           "error": null,
           "incomplete_details": null,
           "instructions": null,
@@ -83,7 +83,7 @@
           "object": "response",
           "output": [
             {
-              "id": "rs_070dfff7bcf67f380069688b3c124c8199b5cc171109592f61",
+              "id": "rs_049e3d1940643cf9006968b5355b308196a10e2ec067778f9d",
               "summary": [],
               "type": "reasoning",
               "content": null,
@@ -91,11 +91,11 @@
               "status": null
             },
             {
-              "id": "msg_070dfff7bcf67f380069688b3eb344819989b21bc5f5cdf5df",
+              "id": "msg_049e3d1940643cf9006968b5372e748196b637d74b8195852c",
               "content": [
                 {
                   "annotations": [],
-                  "text": "THOUGHT: I will list the repository contents to find the project structure and locate the relevant source files under the testbed directory to inspect where the in_bulk uniqueness check might be implemented.\n\n```bash\nls -la\n```",
+                  "text": "THOUGHT: I need to inspect the repository to find the Django-like QuerySet implementation and tests that reference in_bulk behavior. I'll list files at the top level to locate relevant modules to modify.\n\n```bash\nls -la\n```",
                   "type": "output_text",
                   "logprobs": []
                 }
@@ -131,12 +131,12 @@
               "cached_tokens": 0,
               "text_tokens": null
             },
-            "output_tokens": 180,
+            "output_tokens": 182,
             "output_tokens_details": {
               "reasoning_tokens": 128,
               "text_tokens": null
             },
-            "total_tokens": 1658,
+            "total_tokens": 1660,
             "cost": null
           },
           "user": null,
@@ -145,7 +145,7 @@
           "billing": {
             "payer": "developer"
           },
-          "completed_at": 1768459071,
+          "completed_at": 1768469815,
           "frequency_penalty": 0.0,
           "max_tool_calls": null,
           "presence_penalty": 0.0,
@@ -159,17 +159,17 @@
     },
     {
       "role": "user",
-      "content": "<returncode>0</returncode>\n<output>\ntotal 176\ndrwxrwxrwx   1 root root  4096 Sep 10 10:47 .\ndrwxr-xr-x   1 root root  4096 Jan 15 06:37 ..\n-rw-r--r--   1 root root   782 Sep 10 10:40 .editorconfig\n-rw-r--r--   1 root root    86 Sep 10 10:40 .eslintignore\n-rw-r--r--   1 root root  1294 Sep 10 10:40 .eslintrc\ndrwxrwxrwx   8 root root  4096 Sep 10 10:47 .git\n-rw-r--r--   1 root root   297 Sep 10 10:40 .gitattributes\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 .github\n-rw-r--r--   1 root root   353 Sep 10 10:40 .gitignore\n-rw-r--r--   1 root root   164 Sep 10 10:40 .hgignore\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 .tx\n-rw-r--r--   1 root root 37473 Sep 10 10:40 AUTHORS\n-rw-r--r--   1 root root  1115 Sep 10 10:40 CONTRIBUTING.rst\ndrwxr-xr-x   2 root root  4096 Sep 10 10:47 Django.egg-info\n-rw-r--r--   1 root root   353 Sep 10 10:40 Gruntfile.js\n-rw-r--r--   1 root root   236 Sep 10 10:40 INSTALL\n-rw-r--r--   1 root root  1552 Sep 10 10:40 LICENSE\n-rw-r--r--   1 root root 13227 Sep 10 10:40 LICENSE.python\n-rw-r--r--   1 root root   307 Sep 10 10:40 MANIFEST.in\n-rw-r--r--   1 root root  1900 Sep 10 10:40 README.rst\ndrwxrwxrwx  19 root root  4096 Sep 10 10:47 django\ndrwxrwxrwx  13 root root  4096 Sep 10 10:40 docs\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 extras\ndrwxrwxrwx   4 root root  4096 Sep 10 10:40 js_tests\n-rw-r--r--   1 root root   369 Sep 10 10:40 package.json\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 scripts\n-rw-r--r--   1 root root  2121 Sep 10 10:40 setup.cfg\n-rw-r--r--   1 root root  2368 Sep 10 10:40 setup.py\ndrwxrwxrwx 212 root root 12288 Sep 10 10:40 tests\n-rw-r--r--   1 root root  1535 Sep 10 10:40 tox.ini\n</output>",
-      "timestamp": 1768459071.98704
+      "content": "<returncode>0</returncode>\n<output>\ntotal 176\ndrwxrwxrwx   1 root root  4096 Sep 10 10:47 .\ndrwxr-xr-x   1 root root  4096 Jan 15 09:36 ..\n-rw-r--r--   1 root root   782 Sep 10 10:40 .editorconfig\n-rw-r--r--   1 root root    86 Sep 10 10:40 .eslintignore\n-rw-r--r--   1 root root  1294 Sep 10 10:40 .eslintrc\ndrwxrwxrwx   8 root root  4096 Sep 10 10:47 .git\n-rw-r--r--   1 root root   297 Sep 10 10:40 .gitattributes\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 .github\n-rw-r--r--   1 root root   353 Sep 10 10:40 .gitignore\n-rw-r--r--   1 root root   164 Sep 10 10:40 .hgignore\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 .tx\n-rw-r--r--   1 root root 37473 Sep 10 10:40 AUTHORS\n-rw-r--r--   1 root root  1115 Sep 10 10:40 CONTRIBUTING.rst\ndrwxr-xr-x   2 root root  4096 Sep 10 10:47 Django.egg-info\n-rw-r--r--   1 root root   353 Sep 10 10:40 Gruntfile.js\n-rw-r--r--   1 root root   236 Sep 10 10:40 INSTALL\n-rw-r--r--   1 root root  1552 Sep 10 10:40 LICENSE\n-rw-r--r--   1 root root 13227 Sep 10 10:40 LICENSE.python\n-rw-r--r--   1 root root   307 Sep 10 10:40 MANIFEST.in\n-rw-r--r--   1 root root  1900 Sep 10 10:40 README.rst\ndrwxrwxrwx  19 root root  4096 Sep 10 10:47 django\ndrwxrwxrwx  13 root root  4096 Sep 10 10:40 docs\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 extras\ndrwxrwxrwx   4 root root  4096 Sep 10 10:40 js_tests\n-rw-r--r--   1 root root   369 Sep 10 10:40 package.json\ndrwxrwxrwx   2 root root  4096 Sep 10 10:40 scripts\n-rw-r--r--   1 root root  2121 Sep 10 10:40 setup.cfg\n-rw-r--r--   1 root root  2368 Sep 10 10:40 setup.py\ndrwxrwxrwx 212 root root 12288 Sep 10 10:40 tests\n-rw-r--r--   1 root root  1535 Sep 10 10:40 tox.ini\n</output>",
+      "timestamp": 1768469816.4594154
     },
     {
       "role": "assistant",
-      "content": "THOUGHT: I need to find where QuerySet.in_bulk() is implemented so I can inspect and modify the uniqueness check. I'll search the codebase for the in_bulk method definition.\n\n```bash\ngrep -nR \"def in_bulk\" django || true\n```",
-      "timestamp": 1768459078.385951,
+      "content": "THOUGHT: I need to find where in_bulk is implemented and where tests reference it to understand the failing behavior. I'll search the repository for \"in_bulk(\" occurrences to locate the QuerySet implementation and related tests.\n\n```bash\ngrep -R --line-number \"in_bulk(\" -n .\n```",
+      "timestamp": 1768469820.9211442,
       "extra": {
         "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiM2ZmM2I4ODE5OTljYzA4ZjBiYzM0YTA4NTE=",
-          "created_at": 1768459072,
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1Mzg2N2UwODE5NmFhZWI0OTM5MjBkNjg5MjY=",
+          "created_at": 1768469816,
           "error": null,
           "incomplete_details": null,
           "instructions": null,
@@ -178,7 +178,7 @@
           "object": "response",
           "output": [
             {
-              "id": "rs_070dfff7bcf67f380069688b405c0081999494a425156958ed",
+              "id": "rs_049e3d1940643cf9006968b538f0ac819697dd83f1cbcb8019",
               "summary": [],
               "type": "reasoning",
               "content": null,
@@ -186,11 +186,11 @@
               "status": null
             },
             {
-              "id": "msg_070dfff7bcf67f380069688b450bfc8199a86c3de2a6b559d8",
+              "id": "msg_049e3d1940643cf9006968b53bcba081969af394eaf2ece3d0",
               "content": [
                 {
                   "annotations": [],
-                  "text": "THOUGHT: I need to find where QuerySet.in_bulk() is implemented so I can inspect and modify the uniqueness check. I'll search the codebase for the in_bulk method definition.\n\n```bash\ngrep -nR \"def in_bulk\" django || true\n```",
+                  "text": "THOUGHT: I need to find where in_bulk is implemented and where tests reference it to understand the failing behavior. I'll search the repository for \"in_bulk(\" occurrences to locate the QuerySet implementation and related tests.\n\n```bash\ngrep -R --line-number \"in_bulk(\" -n .\n```",
                   "type": "output_text",
                   "logprobs": []
                 }
@@ -206,7 +206,7 @@
           "tools": [],
           "top_p": 1.0,
           "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688b3bc75c81999baec61a16a76411",
+          "previous_response_id": "resp_049e3d1940643cf9006968b5350d088196aed95d2247995282",
           "reasoning": {
             "effort": "high",
             "summary": null
@@ -220,18 +220,18 @@
           },
           "truncation": "disabled",
           "usage": {
-            "input_tokens": 2295,
+            "input_tokens": 2297,
             "input_tokens_details": {
               "audio_tokens": null,
               "cached_tokens": 0,
               "text_tokens": null
             },
-            "output_tokens": 381,
+            "output_tokens": 323,
             "output_tokens_details": {
-              "reasoning_tokens": 320,
+              "reasoning_tokens": 256,
               "text_tokens": null
             },
-            "total_tokens": 2676,
+            "total_tokens": 2620,
             "cost": null
           },
           "user": null,
@@ -240,7 +240,7 @@
           "billing": {
             "payer": "developer"
           },
-          "completed_at": 1768459078,
+          "completed_at": 1768469820,
           "frequency_penalty": 0.0,
           "max_tool_calls": null,
           "presence_penalty": 0.0,
@@ -254,17 +254,17 @@
     },
     {
       "role": "user",
-      "content": "<returncode>0</returncode>\n<output>\ndjango/db/models/query.py:685:    def in_bulk(self, id_list=None, *, field_name='pk'):\n</output>",
-      "timestamp": 1768459079.8032682
+      "content": "<returncode>0</returncode>\n<output>\n./django/db/models/query.py:685:    def in_bulk(self, id_list=None, *, field_name='pk'):\n./django/db/models/query.py:693:            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n./tests/lookup/tests.py:145:    def test_in_bulk(self):\n./tests/lookup/tests.py:146:        # in_bulk() takes a list of IDs and returns a dictionary mapping IDs to objects.\n./tests/lookup/tests.py:147:        arts = Article.objects.in_bulk([self.a1.id, self.a2.id])\n./tests/lookup/tests.py:151:            Article.objects.in_bulk(),\n./tests/lookup/tests.py:162:        self.assertEqual(Article.objects.in_bulk([self.a3.id]), {self.a3.id: self.a3})\n./tests/lookup/tests.py:163:        self.assertEqual(Article.objects.in_bulk({self.a3.id}), {self.a3.id: self.a3})\n./tests/lookup/tests.py:164:        self.assertEqual(Article.objects.in_bulk(frozenset([self.a3.id])), {self.a3.id: self.a3})\n./tests/lookup/tests.py:165:        self.assertEqual(Article.objects.in_bulk((self.a3.id,)), {self.a3.id: self.a3})\n./tests/lookup/tests.py:166:        self.assertEqual(Article.objects.in_bulk([1000]), {})\n./tests/lookup/tests.py:167:        self.assertEqual(Article.objects.in_bulk([]), {})\n./tests/lookup/tests.py:168:        self.assertEqual(Article.objects.in_bulk(iter([self.a1.id])), {self.a1.id: self.a1})\n./tests/lookup/tests.py:169:        self.assertEqual(Article.objects.in_bulk(iter([])), {})\n./tests/lookup/tests.py:171:            Article.objects.in_bulk(headline__startswith='Blah')\n./tests/lookup/tests.py:180:            self.assertEqual(Author.objects.in_bulk(authors), authors)\n./tests/lookup/tests.py:184:            Article.objects.in_bulk([self.a1.slug, self.a2.slug, self.a3.slug], field_name='slug'),\n./tests/lookup/tests.py:193:        msg = \"in_bulk()'s field_name must be a unique field but 'author' isn't.\"\n./tests/lookup/tests.py:195:            Article.objects.in_bulk([self.au1], field_name='author')\n./tests/prefetch_related/tests.py:1209:    def test_in_bulk(self):\n./tests/prefetch_related/tests.py:1218:            bulk = Employee.objects.prefetch_related('serfs').in_bulk([boss1.pk, boss2.pk])\n./tests/custom_pk/tests.py:151:    def test_in_bulk(self):\n./tests/custom_pk/tests.py:155:        emps = Employee.objects.in_bulk([123, 456])\n./tests/custom_pk/tests.py:158:        self.assertEqual(Business.objects.in_bulk([\"Sears\"]), {\n./tests/or_lookups/tests.py:238:            Article.objects.filter(Q(headline__startswith='Hello')).in_bulk([self.a1, self.a2]),\n./docs/ref/models/querysets.txt:2178:``in_bulk()``\n./docs/ref/models/querysets.txt:2181:.. method:: in_bulk(id_list=None, field_name='pk')\n./docs/ref/models/querysets.txt:2191:    >>> Blog.objects.in_bulk([1])\n./docs/ref/models/querysets.txt:2193:    >>> Blog.objects.in_bulk([1, 2])\n./docs/ref/models/querysets.txt:2195:    >>> Blog.objects.in_bulk([])\n./docs/ref/models/querysets.txt:2197:    >>> Blog.objects.in_bulk()\n./docs/ref/models/querysets.txt:2199:    >>> Blog.objects.in_bulk(['beatles_blog'], field_name='slug')\n./docs/ref/models/querysets.txt:2202:If you pass ``in_bulk()`` an empty list, you'll get an empty dictionary.\n./docs/releases/1.10.txt:405:* :meth:`QuerySet.in_bulk() <django.db.models.query.QuerySet.in_bulk>`\n</output>",
+      "timestamp": 1768469822.8619363
     },
     {
       "role": "assistant",
-      "content": "THOUGHT: I'll display the in_bulk method and surrounding lines in django/db/models/query.py so I can inspect the uniqueness check and understand how to change it to accept UniqueConstraint-based unique fields.\n\n```bash\nnl -ba django/db/models/query.py | sed -n '1,240p'\n```",
-      "timestamp": 1768459087.2634587,
+      "content": "THOUGHT: I will open the QuerySet implementation around the in_bulk method to inspect the uniqueness check and determine how to modify it to consider UniqueConstraint-based uniqueness (constraints in model _meta) as well as field.unique attribute.\n\n```bash\nnl -ba django/db/models/query.py | sed -n '640,740p'\n```",
+      "timestamp": 1768469827.836758,
       "extra": {
         "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiNDdjM2U4ODE5OTg3NTQxODU3Mzk1OTA5ZDg=",
-          "created_at": 1768459079,
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1M2VjZWEwODE5Njg2NGY3MzIyNzRlMjJmZTQ=",
+          "created_at": 1768469823,
           "error": null,
           "incomplete_details": null,
           "instructions": null,
@@ -273,7 +273,7 @@
           "object": "response",
           "output": [
             {
-              "id": "rs_070dfff7bcf67f380069688b4832f481999ee8e321ab397b45",
+              "id": "rs_049e3d1940643cf9006968b53f4ed48196a45f8caaaedbe180",
               "summary": [],
               "type": "reasoning",
               "content": null,
@@ -281,11 +281,11 @@
               "status": null
             },
             {
-              "id": "msg_070dfff7bcf67f380069688b4e0d4481998fc68d3a17b706a4",
+              "id": "msg_049e3d1940643cf9006968b54264148196b83de8d8b1faa27f",
               "content": [
                 {
                   "annotations": [],
-                  "text": "THOUGHT: I'll display the in_bulk method and surrounding lines in django/db/models/query.py so I can inspect the uniqueness check and understand how to change it to accept UniqueConstraint-based unique fields.\n\n```bash\nnl -ba django/db/models/query.py | sed -n '1,240p'\n```",
+                  "text": "THOUGHT: I will open the QuerySet implementation around the in_bulk method to inspect the uniqueness check and determine how to modify it to consider UniqueConstraint-based uniqueness (constraints in model _meta) as well as field.unique attribute.\n\n```bash\nnl -ba django/db/models/query.py | sed -n '640,740p'\n```",
                   "type": "output_text",
                   "logprobs": []
                 }
@@ -301,7 +301,7 @@
           "tools": [],
           "top_p": 1.0,
           "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688b3ff3b881999cc08f0bc34a0851",
+          "previous_response_id": "resp_049e3d1940643cf9006968b53867e08196aaeb493920d68926",
           "reasoning": {
             "effort": "high",
             "summary": null
@@ -315,18 +315,232 @@
           },
           "truncation": "disabled",
           "usage": {
-            "input_tokens": 2399,
+            "input_tokens": 3261,
             "input_tokens_details": {
               "audio_tokens": null,
               "cached_tokens": 1792,
               "text_tokens": null
             },
-            "output_tokens": 388,
+            "output_tokens": 267,
+            "output_tokens_details": {
+              "reasoning_tokens": 192,
+              "text_tokens": null
+            },
+            "total_tokens": 3528,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768469827,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n   640\t                    \"', '\".join(sorted(invalid_params)),\n   641\t                ))\n   642\t        return params\n   643\t\n   644\t    def _earliest(self, *fields):\n   645\t        \"\"\"\n   646\t        Return the earliest object according to fields (if given) or by the\n   647\t        model's Meta.get_latest_by.\n   648\t        \"\"\"\n   649\t        if fields:\n   650\t            order_by = fields\n   651\t        else:\n   652\t            order_by = getattr(self.model._meta, 'get_latest_by')\n   653\t            if order_by and not isinstance(order_by, (tuple, list)):\n   654\t                order_by = (order_by,)\n   655\t        if order_by is None:\n   656\t            raise ValueError(\n   657\t                \"earliest() and latest() require either fields as positional \"\n   658\t                \"arguments or 'get_latest_by' in the model's Meta.\"\n   659\t            )\n   660\t\n   661\t        assert not self.query.is_sliced, \\\n   662\t            \"Cannot change a query once a slice has been taken.\"\n   663\t        obj = self._chain()\n   664\t        obj.query.set_limits(high=1)\n   665\t        obj.query.clear_ordering(force_empty=True)\n   666\t        obj.query.add_ordering(*order_by)\n   667\t        return obj.get()\n   668\t\n   669\t    def earliest(self, *fields):\n   670\t        return self._earliest(*fields)\n   671\t\n   672\t    def latest(self, *fields):\n   673\t        return self.reverse()._earliest(*fields)\n   674\t\n   675\t    def first(self):\n   676\t        \"\"\"Return the first object of a query or None if no match is found.\"\"\"\n   677\t        for obj in (self if self.ordered else self.order_by('pk'))[:1]:\n   678\t            return obj\n   679\t\n   680\t    def last(self):\n   681\t        \"\"\"Return the last object of a query or None if no match is found.\"\"\"\n   682\t        for obj in (self.reverse() if self.ordered else self.order_by('-pk'))[:1]:\n   683\t            return obj\n   684\t\n   685\t    def in_bulk(self, id_list=None, *, field_name='pk'):\n   686\t        \"\"\"\n   687\t        Return a dictionary mapping each of the given IDs to the object with\n   688\t        that ID. If `id_list` isn't provided, evaluate the entire QuerySet.\n   689\t        \"\"\"\n   690\t        assert not self.query.is_sliced, \\\n   691\t            \"Cannot use 'limit' or 'offset' with in_bulk\"\n   692\t        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n   693\t            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n   694\t        if id_list is not None:\n   695\t            if not id_list:\n   696\t                return {}\n   697\t            filter_key = '{}__in'.format(field_name)\n   698\t            batch_size = connections[self.db].features.max_query_params\n   699\t            id_list = tuple(id_list)\n   700\t            # If the database has a limit on the number of query parameters\n   701\t            # (e.g. SQLite), retrieve objects in batches if necessary.\n   702\t            if batch_size and batch_size < len(id_list):\n   703\t                qs = ()\n   704\t                for offset in range(0, len(id_list), batch_size):\n   705\t                    batch = id_list[offset:offset + batch_size]\n   706\t                    qs += tuple(self.filter(**{filter_key: batch}).order_by())\n   707\t            else:\n   708\t                qs = self.filter(**{filter_key: id_list}).order_by()\n   709\t        else:\n   710\t            qs = self._chain()\n   711\t        return {getattr(obj, field_name): obj for obj in qs}\n   712\t\n   713\t    def delete(self):\n   714\t        \"\"\"Delete the records in the current QuerySet.\"\"\"\n   715\t        self._not_support_combined_queries('delete')\n   716\t        assert not self.query.is_sliced, \\\n   717\t            \"Cannot use 'limit' or 'offset' with delete.\"\n   718\t\n   719\t        if self._fields is not None:\n   720\t            raise TypeError(\"Cannot call delete() after .values() or .values_list()\")\n   721\t\n   722\t        del_query = self._chain()\n   723\t\n   724\t        # The delete is actually 2 queries - one to find related objects,\n   725\t        # and one to delete. Make sure that the discovery of related\n   726\t        # objects is performed on the same database as the deletion.\n   727\t        del_query._for_write = True\n   728\t\n   729\t        # Disable non-supported fields.\n   730\t        del_query.query.select_for_update = False\n   731\t        del_query.query.select_related = False\n   732\t        del_query.query.clear_ordering(force_empty=True)\n   733\t\n   734\t        collector = Collector(using=del_query.db)\n   735\t        collector.collect(del_query)\n   736\t        deleted, _rows_count = collector.delete()\n   737\t\n   738\t        # Clear the result cache, in case this QuerySet gets reused.\n   739\t        self._result_cache = None\n   740\t        return deleted, _rows_count\n</output>",
+      "timestamp": 1768469828.0222805
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I will open the lookup tests to inspect the in_bulk-related tests and confirm the expected behavior around unique fields and UniqueConstraint. This will guide how to modify QuerySet.in_bulk to accept fields that are unique via UniqueConstraint.\n\n```bash\nnl -ba tests/lookup/tests.py | sed -n '120,220p'\n```",
+      "timestamp": 1768469832.933711,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NDNmOTU4ODE5Njg0YmVjYTgwZTVmOWY5ZDc=",
+          "created_at": 1768469828,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_049e3d1940643cf9006968b54491888196a26272a74fe0aefc",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_049e3d1940643cf9006968b546a5f481968ef09956055e4bf8",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_049e3d1940643cf9006968b547cd4c819696aff0bf7ecd9ee0",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "THOUGHT: I will open the lookup tests to inspect the in_bulk-related tests and confirm the expected behavior around unique fields and UniqueConstraint. This will guide how to modify QuerySet.in_bulk to accept fields that are unique via UniqueConstraint.\n\n```bash\nnl -ba tests/lookup/tests.py | sed -n '120,220p'\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_049e3d1940643cf9006968b53ecea08196864f732274e22fe4",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 4556,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 2816,
+              "text_tokens": null
+            },
+            "output_tokens": 333,
+            "output_tokens_details": {
+              "reasoning_tokens": 256,
+              "text_tokens": null
+            },
+            "total_tokens": 4889,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768469832,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\n   120\t            ],\n   121\t            transform=attrgetter('headline')\n   122\t        )\n   123\t        # iterator() can be used on any QuerySet.\n   124\t        self.assertQuerysetEqual(\n   125\t            Article.objects.filter(headline__endswith='4').iterator(),\n   126\t            ['Article 4'],\n   127\t            transform=attrgetter('headline'))\n   128\t\n   129\t    def test_count(self):\n   130\t        # count() returns the number of objects matching search criteria.\n   131\t        self.assertEqual(Article.objects.count(), 7)\n   132\t        self.assertEqual(Article.objects.filter(pub_date__exact=datetime(2005, 7, 27)).count(), 3)\n   133\t        self.assertEqual(Article.objects.filter(headline__startswith='Blah blah').count(), 0)\n   134\t\n   135\t        # count() should respect sliced query sets.\n   136\t        articles = Article.objects.all()\n   137\t        self.assertEqual(articles.count(), 7)\n   138\t        self.assertEqual(articles[:4].count(), 4)\n   139\t        self.assertEqual(articles[1:100].count(), 6)\n   140\t        self.assertEqual(articles[10:100].count(), 0)\n   141\t\n   142\t        # Date and date/time lookups can also be done with strings.\n   143\t        self.assertEqual(Article.objects.filter(pub_date__exact='2005-07-27 00:00:00').count(), 3)\n   144\t\n   145\t    def test_in_bulk(self):\n   146\t        # in_bulk() takes a list of IDs and returns a dictionary mapping IDs to objects.\n   147\t        arts = Article.objects.in_bulk([self.a1.id, self.a2.id])\n   148\t        self.assertEqual(arts[self.a1.id], self.a1)\n   149\t        self.assertEqual(arts[self.a2.id], self.a2)\n   150\t        self.assertEqual(\n   151\t            Article.objects.in_bulk(),\n   152\t            {\n   153\t                self.a1.id: self.a1,\n   154\t                self.a2.id: self.a2,\n   155\t                self.a3.id: self.a3,\n   156\t                self.a4.id: self.a4,\n   157\t                self.a5.id: self.a5,\n   158\t                self.a6.id: self.a6,\n   159\t                self.a7.id: self.a7,\n   160\t            }\n   161\t        )\n   162\t        self.assertEqual(Article.objects.in_bulk([self.a3.id]), {self.a3.id: self.a3})\n   163\t        self.assertEqual(Article.objects.in_bulk({self.a3.id}), {self.a3.id: self.a3})\n   164\t        self.assertEqual(Article.objects.in_bulk(frozenset([self.a3.id])), {self.a3.id: self.a3})\n   165\t        self.assertEqual(Article.objects.in_bulk((self.a3.id,)), {self.a3.id: self.a3})\n   166\t        self.assertEqual(Article.objects.in_bulk([1000]), {})\n   167\t        self.assertEqual(Article.objects.in_bulk([]), {})\n   168\t        self.assertEqual(Article.objects.in_bulk(iter([self.a1.id])), {self.a1.id: self.a1})\n   169\t        self.assertEqual(Article.objects.in_bulk(iter([])), {})\n   170\t        with self.assertRaises(TypeError):\n   171\t            Article.objects.in_bulk(headline__startswith='Blah')\n   172\t\n   173\t    def test_in_bulk_lots_of_ids(self):\n   174\t        test_range = 2000\n   175\t        max_query_params = connection.features.max_query_params\n   176\t        expected_num_queries = ceil(test_range / max_query_params) if max_query_params else 1\n   177\t        Author.objects.bulk_create([Author() for i in range(test_range - Author.objects.count())])\n   178\t        authors = {author.pk: author for author in Author.objects.all()}\n   179\t        with self.assertNumQueries(expected_num_queries):\n   180\t            self.assertEqual(Author.objects.in_bulk(authors), authors)\n   181\t\n   182\t    def test_in_bulk_with_field(self):\n   183\t        self.assertEqual(\n   184\t            Article.objects.in_bulk([self.a1.slug, self.a2.slug, self.a3.slug], field_name='slug'),\n   185\t            {\n   186\t                self.a1.slug: self.a1,\n   187\t                self.a2.slug: self.a2,\n   188\t                self.a3.slug: self.a3,\n   189\t            }\n   190\t        )\n   191\t\n   192\t    def test_in_bulk_non_unique_field(self):\n   193\t        msg = \"in_bulk()'s field_name must be a unique field but 'author' isn't.\"\n   194\t        with self.assertRaisesMessage(ValueError, msg):\n   195\t            Article.objects.in_bulk([self.au1], field_name='author')\n   196\t\n   197\t    def test_values(self):\n   198\t        # values() returns a list of dictionaries instead of object instances --\n   199\t        # and you can specify which fields you want to retrieve.\n   200\t        self.assertSequenceEqual(\n   201\t            Article.objects.values('headline'),\n   202\t            [\n   203\t                {'headline': 'Article 5'},\n   204\t                {'headline': 'Article 6'},\n   205\t                {'headline': 'Article 4'},\n   206\t                {'headline': 'Article 2'},\n   207\t                {'headline': 'Article 3'},\n   208\t                {'headline': 'Article 7'},\n   209\t                {'headline': 'Article 1'},\n   210\t            ],\n   211\t        )\n   212\t        self.assertSequenceEqual(\n   213\t            Article.objects.filter(pub_date__exact=datetime(2005, 7, 27)).values('id'),\n   214\t            [{'id': self.a2.id}, {'id': self.a3.id}, {'id': self.a7.id}],\n   215\t        )\n   216\t        self.assertSequenceEqual(\n   217\t            Article.objects.values('id', 'headline'),\n   218\t            [\n   219\t                {'id': self.a5.id, 'headline': 'Article 5'},\n   220\t                {'id': self.a6.id, 'headline': 'Article 6'},\n</output>",
+      "timestamp": 1768469833.0859547
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I'll search the codebase for the UniqueConstraint implementation and usages to find how to detect uniqueness declared via constraints so I can modify in_bulk accordingly.\n\n```bash\ngrep -R --line-number \"class UniqueConstraint\" -n django || true\n```",
+      "timestamp": 1768469838.9842036,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NDkwYjg4ODE5NmE1YjgzMDA4YTk1Y2RjMTA=",
+          "created_at": 1768469833,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_049e3d1940643cf9006968b54b7e5c8196bc995d2c9778979b",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_049e3d1940643cf9006968b54c58648196821762a7abb41a62",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_049e3d1940643cf9006968b54d717081969713046c4f3ec171",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_049e3d1940643cf9006968b54d96d88196bc11cfeea479d424",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "THOUGHT: I'll search the codebase for the UniqueConstraint implementation and usages to find how to detect uniqueness declared via constraints so I can modify in_bulk accordingly.\n\n```bash\ngrep -R --line-number \"class UniqueConstraint\" -n django || true\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_049e3d1940643cf9006968b543f958819684beca80e5f9f9d7",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 6042,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 3840,
+              "text_tokens": null
+            },
+            "output_tokens": 380,
             "output_tokens_details": {
               "reasoning_tokens": 320,
               "text_tokens": null
             },
-            "total_tokens": 2787,
+            "total_tokens": 6422,
             "cost": null
           },
           "user": null,
@@ -335,7 +549,7 @@
           "billing": {
             "payer": "developer"
           },
-          "completed_at": 1768459087,
+          "completed_at": 1768469838,
           "frequency_penalty": 0.0,
           "max_tool_calls": null,
           "presence_penalty": 0.0,
@@ -349,17 +563,17 @@
     },
     {
       "role": "user",
-      "content": "<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning><output_head>\n     1\t\"\"\"\n     2\tThe main QuerySet implementation. This provides the public API for the ORM.\n     3\t\"\"\"\n     4\t\n     5\timport copy\n     6\timport operator\n     7\timport warnings\n     8\tfrom collections import namedtuple\n     9\tfrom functools import lru_cache\n    10\tfrom itertools import chain\n    11\t\n    12\tfrom django.conf import settings\n    13\tfrom django.core import exceptions\n    14\tfrom django.db import (\n    15\t    DJANGO_VERSION_PICKLE_KEY, IntegrityError, NotSupportedError, connections,\n    16\t    router, transaction,\n    17\t)\n    18\tfrom django.db.models import AutoField, DateField, DateTimeField, sql\n    19\tfrom django.db.models.constants import LOOKUP_SEP\n    20\tfrom django.db.models.deletion import Collector\n    21\tfrom django.db.models.expressions import Case, Expression, F, Value, When\n    22\tfrom django.db.models.functions import Cast, Trunc\n    23\tfrom django.db.models.query_utils import FilteredRelation, Q\n    24\tfrom django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE\n    25\tfrom django.db.models.utils import resolve_callables\n    26\tfrom django.utils import timezone\n    27\tfrom django.utils.functional import cached_property, partition\n    28\tfrom django.utils.version import get_version\n    29\t\n    30\t# The maximum number of results to fetch in a get() query.\n    31\tMAX_GET_RESULTS = 21\n    32\t\n    33\t# The maximum number of items to display in a QuerySet.__repr__\n    34\tREPR_OUTPUT_SIZE = 20\n    35\t\n    36\t\n    37\tclass BaseIterable:\n    38\t    def __init__(self, queryset, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):\n    39\t        self.queryset = queryset\n    40\t        self.chunked_fetch = chunked_fetch\n    41\t        self.chunk_size = chunk_size\n    42\t\n    43\t\n    44\tclass ModelIterable(BaseIterable):\n    45\t    \"\"\"Iterable that yields a model instance for each row.\"\"\"\n    46\t\n    47\t    def __iter__(self):\n    48\t        queryset = self.queryset\n    49\t        db = queryset.db\n    50\t        compiler = queryset.query.get_compiler(using=db)\n    51\t        # Execute the query. This will also fill compiler.select, klass_info,\n    52\t        # and annotations.\n    53\t        results = compiler.execute_sql(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)\n    54\t        select, klass_info, annotation_col_map = (compiler.select, compiler.klass_info,\n    55\t                                                  compiler.annotation_col_map)\n    56\t        model_cls = klass_info['model']\n    57\t        select_fields = klass_info['select_fields']\n    58\t        model_fields_start, model_fields_end = select_fields[0], select_fields[-1] + 1\n    59\t        init_list = [f[0].target.attname\n    60\t                     for f in select[model_fields_start:model_fields_end]]\n    61\t        related_populators = get_related_populators(klass_info, select, db)\n    62\t        known_related_objects = [\n    63\t            (field, related_objs, operator.attrgetter(*[\n    64\t                field.attname\n    65\t                if from_field == 'self' else\n    66\t                queryset.model._meta.get_field(from_field).attname\n    67\t                for from_field in field.from_fields\n    68\t            ])) for field, related_objs in queryset._known_related_objects.items()\n    69\t        ]\n    70\t        for row in compiler.results_iter(results):\n    71\t            obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])\n    72\t            for rel_populator in related_populators:\n    73\t                rel_populator.populate(row, obj)\n    74\t            if annotation_col_map:\n    75\t                for attr_name, col_pos in annotation_col_map.items():\n    76\t                    setattr(obj, attr_name, row[col_pos])\n    77\t\n    78\t            # Add the known related objects to the model.\n    79\t            for field, rel_objs, rel_getter in known_related_objects:\n    80\t                # Avoid overwriting objects loaded by, e.g., select_related().\n    81\t                if field.is_cached(obj):\n    82\t                    continue\n    83\t                rel_obj_id = rel_getter(obj)\n    84\t                try:\n    85\t                    rel_obj = rel_objs[rel_obj_id]\n    86\t                except KeyError:\n    87\t                    pass  # May happen in qs1 | qs2 scenarios.\n    88\t                else:\n    89\t                    setattr(obj, field.name, rel_obj)\n    90\t\n    91\t            yield obj\n    92\t\n    93\t\n    94\tclass ValuesIterable(BaseIterable):\n    95\t    \"\"\"\n    96\t    Iterable returned by QuerySet.values() that yields a dict for each row.\n    97\t    \"\"\"\n    98\t\n    99\t    def __iter__(self):\n   100\t        queryset = self.queryset\n   101\t        query = queryset.query\n   102\t        compiler = query.get_compiler(queryset.db)\n   103\t\n   104\t        # extra(select=...) cols are always at the start of the row.\n   105\t        names = [\n   106\t            *query.extra_select,\n   107\t            *query.values_select,\n   108\t            *query\n</output_head>\n<elided_chars>\n485 characters elided\n</elided_chars>\n<output_tail>\n_(self):\n   122\t        queryset = self.queryset\n   123\t        query = queryset.query\n   124\t        compiler = query.get_compiler(queryset.db)\n   125\t\n   126\t        if queryset._fields:\n   127\t            # extra(select=...) cols are always at the start of the row.\n   128\t            names = [\n   129\t                *query.extra_select,\n   130\t                *query.values_select,\n   131\t                *query.annotation_select,\n   132\t            ]\n   133\t            fields = [*queryset._fields, *(f for f in query.annotation_select if f not in queryset._fields)]\n   134\t            if fields != names:\n   135\t                # Reorder according to fields.\n   136\t                index_map = {name: idx for idx, name in enumerate(names)}\n   137\t                rowfactory = operator.itemgetter(*[index_map[f] for f in fields])\n   138\t                return map(\n   139\t                    rowfactory,\n   140\t                    compiler.results_iter(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)\n   141\t                )\n   142\t        return compiler.results_iter(tuple_expected=True, chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size)\n   143\t\n   144\t\n   145\tclass NamedValuesListIterable(ValuesListIterable):\n   146\t    \"\"\"\n   147\t    Iterable returned by QuerySet.values_list(named=True) that yields a\n   148\t    namedtuple for each row.\n   149\t    \"\"\"\n   150\t\n   151\t    @staticmethod\n   152\t    @lru_cache()\n   153\t    def create_namedtuple_class(*names):\n   154\t        # Cache namedtuple() with @lru_cache() since it's too slow to be\n   155\t        # called for every QuerySet evaluation.\n   156\t        return namedtuple('Row', names)\n   157\t\n   158\t    def __iter__(self):\n   159\t        queryset = self.queryset\n   160\t        if queryset._fields:\n   161\t            names = queryset._fields\n   162\t        else:\n   163\t            query = queryset.query\n   164\t            names = [*query.extra_select, *query.values_select, *query.annotation_select]\n   165\t        tuple_class = self.create_namedtuple_class(*names)\n   166\t        new = tuple.__new__\n   167\t        for row in super().__iter__():\n   168\t            yield new(tuple_class, row)\n   169\t\n   170\t\n   171\tclass FlatValuesListIterable(BaseIterable):\n   172\t    \"\"\"\n   173\t    Iterable returned by QuerySet.values_list(flat=True) that yields single\n   174\t    values.\n   175\t    \"\"\"\n   176\t\n   177\t    def __iter__(self):\n   178\t        queryset = self.queryset\n   179\t        compiler = queryset.query.get_compiler(queryset.db)\n   180\t        for row in compiler.results_iter(chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size):\n   181\t            yield row[0]\n   182\t\n   183\t\n   184\tclass QuerySet:\n   185\t    \"\"\"Represent a lazy database lookup for a set of objects.\"\"\"\n   186\t\n   187\t    def __init__(self, model=None, query=None, using=None, hints=None):\n   188\t        self.model = model\n   189\t        self._db = using\n   190\t        self._hints = hints or {}\n   191\t        self._query = query or sql.Query(self.model)\n   192\t        self._result_cache = None\n   193\t        self._sticky_filter = False\n   194\t        self._for_write = False\n   195\t        self._prefetch_related_lookups = ()\n   196\t        self._prefetch_done = False\n   197\t        self._known_related_objects = {}  # {rel_field: {pk: rel_obj}}\n   198\t        self._iterable_class = ModelIterable\n   199\t        self._fields = None\n   200\t        self._defer_next_filter = False\n   201\t        self._deferred_filter = None\n   202\t\n   203\t    @property\n   204\t    def query(self):\n   205\t        if self._deferred_filter:\n   206\t            negate, args, kwargs = self._deferred_filter\n   207\t            self._filter_or_exclude_inplace(negate, *args, **kwargs)\n   208\t            self._deferred_filter = None\n   209\t        return self._query\n   210\t\n   211\t    @query.setter\n   212\t    def query(self, value):\n   213\t        self._query = value\n   214\t\n   215\t    def as_manager(cls):\n   216\t        # Address the circular dependency between `Queryset` and `Manager`.\n   217\t        from django.db.models.manager import Manager\n   218\t        manager = Manager.from_queryset(cls)()\n   219\t        manager._built_with_as_manager = True\n   220\t        return manager\n   221\t    as_manager.queryset_only = True\n   222\t    as_manager = classmethod(as_manager)\n   223\t\n   224\t    ########################\n   225\t    # PYTHON MAGIC METHODS #\n   226\t    ########################\n   227\t\n   228\t    def __deepcopy__(self, memo):\n   229\t        \"\"\"Don't populate the QuerySet's cache.\"\"\"\n   230\t        obj = self.__class__()\n   231\t        for k, v in self.__dict__.items():\n   232\t            if k == '_result_cache':\n   233\t                obj.__dict__[k] = None\n   234\t            else:\n   235\t                obj.__dict__[k] = copy.deepcopy(v, memo)\n   236\t        return obj\n   237\t\n   238\t    def __getstate__(self):\n   239\t        # Force the cache to be fully populated.\n   240\t        self._fetch_all()\n\n</output_tail>",
-      "timestamp": 1768459087.4854805
+      "content": "<returncode>0</returncode>\n<output>\ndjango/db/models/constraints.py:72:class UniqueConstraint(BaseConstraint):\n</output>",
+      "timestamp": 1768469839.198717
     },
     {
       "role": "assistant",
-      "content": "THOUGHT: I'll display the portion of django/db/models/query.py that contains the in_bulk method (around line 680) to inspect how the uniqueness check is implemented so I can adjust it to recognize UniqueConstraint-based unique fields.\n\n```bash\nnl -ba django/db/models/query.py | sed -n '640,720p'\n```",
-      "timestamp": 1768459094.9717317,
+      "content": "THOUGHT: I need to inspect the UniqueConstraint implementation to see how it records the involved fields so I can detect when a field is unique due to a UniqueConstraint (e.g., a single-field UniqueConstraint). I'll open the constraints module to read the UniqueConstraint class.\n\n```bash\nnl -ba django/db/models/constraints.py | sed -n '1,240p'\n```",
+      "timestamp": 1768469844.1819742,
       "extra": {
         "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiNGY3MmI4ODE5OTg1OTFmMDUyYzQzYWM4YmY=",
-          "created_at": 1768459087,
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NGYyOWFjODE5NmJlMTdmOGI4NzI1MGE4MGI=",
+          "created_at": 1768469839,
           "error": null,
           "incomplete_details": null,
           "instructions": null,
@@ -368,7 +582,7 @@
           "object": "response",
           "output": [
             {
-              "id": "rs_070dfff7bcf67f380069688b4ffa088199b5b93411aa8b4fc9",
+              "id": "rs_049e3d1940643cf9006968b54fddc08196a0e83c6d3acfe9fe",
               "summary": [],
               "type": "reasoning",
               "content": null,
@@ -376,11 +590,11 @@
               "status": null
             },
             {
-              "id": "msg_070dfff7bcf67f380069688b558620819980d4b6f99cbf474b",
+              "id": "msg_049e3d1940643cf9006968b552f4e08196ae5792a94b54a319",
               "content": [
                 {
                   "annotations": [],
-                  "text": "THOUGHT: I'll display the portion of django/db/models/query.py that contains the in_bulk method (around line 680) to inspect how the uniqueness check is implemented so I can adjust it to recognize UniqueConstraint-based unique fields.\n\n```bash\nnl -ba django/db/models/query.py | sed -n '640,720p'\n```",
+                  "text": "THOUGHT: I need to inspect the UniqueConstraint implementation to see how it records the involved fields so I can detect when a field is unique due to a UniqueConstraint (e.g., a single-field UniqueConstraint). I'll open the constraints module to read the UniqueConstraint class.\n\n```bash\nnl -ba django/db/models/constraints.py | sed -n '1,240p'\n```",
                   "type": "output_text",
                   "logprobs": []
                 }
@@ -396,7 +610,7 @@
           "tools": [],
           "top_p": 1.0,
           "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688b47c3e8819987541857395909d8",
+          "previous_response_id": "resp_049e3d1940643cf9006968b5490b888196a5b83008a95cdc10",
           "reasoning": {
             "effort": "high",
             "summary": null
@@ -410,232 +624,18 @@
           },
           "truncation": "disabled",
           "usage": {
-            "input_tokens": 5102,
-            "input_tokens_details": {
-              "audio_tokens": null,
-              "cached_tokens": 0,
-              "text_tokens": null
-            },
-            "output_tokens": 395,
-            "output_tokens_details": {
-              "reasoning_tokens": 320,
-              "text_tokens": null
-            },
-            "total_tokens": 5497,
-            "cost": null
-          },
-          "user": null,
-          "store": true,
-          "background": false,
-          "billing": {
-            "payer": "developer"
-          },
-          "completed_at": 1768459094,
-          "frequency_penalty": 0.0,
-          "max_tool_calls": null,
-          "presence_penalty": 0.0,
-          "prompt_cache_key": null,
-          "prompt_cache_retention": null,
-          "safety_identifier": null,
-          "service_tier": "default",
-          "top_logprobs": 0
-        }
-      }
-    },
-    {
-      "role": "user",
-      "content": "<returncode>0</returncode>\n<output>\n   640\t                    \"', '\".join(sorted(invalid_params)),\n   641\t                ))\n   642\t        return params\n   643\t\n   644\t    def _earliest(self, *fields):\n   645\t        \"\"\"\n   646\t        Return the earliest object according to fields (if given) or by the\n   647\t        model's Meta.get_latest_by.\n   648\t        \"\"\"\n   649\t        if fields:\n   650\t            order_by = fields\n   651\t        else:\n   652\t            order_by = getattr(self.model._meta, 'get_latest_by')\n   653\t            if order_by and not isinstance(order_by, (tuple, list)):\n   654\t                order_by = (order_by,)\n   655\t        if order_by is None:\n   656\t            raise ValueError(\n   657\t                \"earliest() and latest() require either fields as positional \"\n   658\t                \"arguments or 'get_latest_by' in the model's Meta.\"\n   659\t            )\n   660\t\n   661\t        assert not self.query.is_sliced, \\\n   662\t            \"Cannot change a query once a slice has been taken.\"\n   663\t        obj = self._chain()\n   664\t        obj.query.set_limits(high=1)\n   665\t        obj.query.clear_ordering(force_empty=True)\n   666\t        obj.query.add_ordering(*order_by)\n   667\t        return obj.get()\n   668\t\n   669\t    def earliest(self, *fields):\n   670\t        return self._earliest(*fields)\n   671\t\n   672\t    def latest(self, *fields):\n   673\t        return self.reverse()._earliest(*fields)\n   674\t\n   675\t    def first(self):\n   676\t        \"\"\"Return the first object of a query or None if no match is found.\"\"\"\n   677\t        for obj in (self if self.ordered else self.order_by('pk'))[:1]:\n   678\t            return obj\n   679\t\n   680\t    def last(self):\n   681\t        \"\"\"Return the last object of a query or None if no match is found.\"\"\"\n   682\t        for obj in (self.reverse() if self.ordered else self.order_by('-pk'))[:1]:\n   683\t            return obj\n   684\t\n   685\t    def in_bulk(self, id_list=None, *, field_name='pk'):\n   686\t        \"\"\"\n   687\t        Return a dictionary mapping each of the given IDs to the object with\n   688\t        that ID. If `id_list` isn't provided, evaluate the entire QuerySet.\n   689\t        \"\"\"\n   690\t        assert not self.query.is_sliced, \\\n   691\t            \"Cannot use 'limit' or 'offset' with in_bulk\"\n   692\t        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n   693\t            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n   694\t        if id_list is not None:\n   695\t            if not id_list:\n   696\t                return {}\n   697\t            filter_key = '{}__in'.format(field_name)\n   698\t            batch_size = connections[self.db].features.max_query_params\n   699\t            id_list = tuple(id_list)\n   700\t            # If the database has a limit on the number of query parameters\n   701\t            # (e.g. SQLite), retrieve objects in batches if necessary.\n   702\t            if batch_size and batch_size < len(id_list):\n   703\t                qs = ()\n   704\t                for offset in range(0, len(id_list), batch_size):\n   705\t                    batch = id_list[offset:offset + batch_size]\n   706\t                    qs += tuple(self.filter(**{filter_key: batch}).order_by())\n   707\t            else:\n   708\t                qs = self.filter(**{filter_key: id_list}).order_by()\n   709\t        else:\n   710\t            qs = self._chain()\n   711\t        return {getattr(obj, field_name): obj for obj in qs}\n   712\t\n   713\t    def delete(self):\n   714\t        \"\"\"Delete the records in the current QuerySet.\"\"\"\n   715\t        self._not_support_combined_queries('delete')\n   716\t        assert not self.query.is_sliced, \\\n   717\t            \"Cannot use 'limit' or 'offset' with delete.\"\n   718\t\n   719\t        if self._fields is not None:\n   720\t            raise TypeError(\"Cannot call delete() after .values() or .values_list()\")\n</output>",
-      "timestamp": 1768459095.1885347
-    },
-    {
-      "role": "assistant",
-      "content": "THOUGHT: I will update django/db/models/query.py to allow in_bulk() to accept a field that is unique due to a UniqueConstraint in the model's Meta.constraints. I'll (1) add UniqueConstraint to the module imports and (2) replace the simple field.unique check with logic that also inspects Meta.constraints for a UniqueConstraint that targets exactly that single field. I'll perform the edit programmatically to ensure correct formatting.\n\n```bash\npython - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/query.py')\ns = p.read_text()\n\n# Add UniqueConstraint to the django.db.models import line.\ns = s.replace(\n    \"from django.db.models import AutoField, DateField, DateTimeField, sql\",\n    \"from django.db.models import AutoField, DateField, DateTimeField, UniqueConstraint, sql\"\n)\n\n# Replace the uniqueness check in in_bulk to also consider UniqueConstraint on a single field.\nold = (\n    \"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\\n\"\n    \"            raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\\n\"\n)\n\nnew = (\n    \"        if field_name != 'pk':\\n\"\n    \"            field = self.model._meta.get_field(field_name)\\n\"\n    \"            if not field.unique:\\n\"\n    \"                # The field may be unique due to a UniqueConstraint in the model's Meta.constraints.\\n\"\n    \"                for constraint in getattr(self.model._meta, 'constraints', ()): \\n\"\n    \"                    if isinstance(constraint, UniqueConstraint) and list(getattr(constraint, 'fields', [])) == [field_name]:\\n\"\n    \"                        break\\n\"\n    \"                else:\\n\"\n    \"                    raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\\n\"\n)\n\nif old in s:\n    s = s.replace(old, new, 1)\nelse:\n    # Fallback: try to replace a slightly different spacing variant\n    import re\n    pattern = re.compile(r\"if field_name != 'pk' and not self\\.model\\._meta\\.get_field\\(field_name\\)\\.unique:\\s+raise ValueError\\([^\\n]+\\)\\n\")\n    if pattern.search(s):\n        s = pattern.sub(new, s, count=1)\n    else:\n        raise SystemExit(\"Pattern to replace not found. Aborting.\")\n\np.write_text(s)\nprint(\"Patched django/db/models/query.py\")\nPY\n```",
-      "timestamp": 1768459143.4479988,
-      "extra": {
-        "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiNTcyMzM0ODE5OTlmYjEzOTFhZmVjZDFmZDE=",
-          "created_at": 1768459095,
-          "error": null,
-          "incomplete_details": null,
-          "instructions": null,
-          "metadata": {},
-          "model": "gpt-5-mini-2025-08-07",
-          "object": "response",
-          "output": [
-            {
-              "id": "rs_070dfff7bcf67f380069688b57be8c8199b7417a9a549f9056",
-              "summary": [],
-              "type": "reasoning",
-              "content": null,
-              "encrypted_content": null,
-              "status": null
-            },
-            {
-              "id": "rs_070dfff7bcf67f380069688b5d15408199abee399dcaffdef0",
-              "summary": [],
-              "type": "reasoning",
-              "content": null,
-              "encrypted_content": null,
-              "status": null
-            },
-            {
-              "id": "rs_070dfff7bcf67f380069688b68b9248199bd4c37e841180cfa",
-              "summary": [],
-              "type": "reasoning",
-              "content": null,
-              "encrypted_content": null,
-              "status": null
-            },
-            {
-              "id": "rs_070dfff7bcf67f380069688b7e507481999faec8a601528a7b",
-              "summary": [],
-              "type": "reasoning",
-              "content": null,
-              "encrypted_content": null,
-              "status": null
-            },
-            {
-              "id": "rs_070dfff7bcf67f380069688b7e74608199a80f59d9289cf007",
-              "summary": [],
-              "type": "reasoning",
-              "content": null,
-              "encrypted_content": null,
-              "status": null
-            },
-            {
-              "id": "msg_070dfff7bcf67f380069688b7f1cc08199b5a36c1593f8e4cb",
-              "content": [
-                {
-                  "annotations": [],
-                  "text": "THOUGHT: I will update django/db/models/query.py to allow in_bulk() to accept a field that is unique due to a UniqueConstraint in the model's Meta.constraints. I'll (1) add UniqueConstraint to the module imports and (2) replace the simple field.unique check with logic that also inspects Meta.constraints for a UniqueConstraint that targets exactly that single field. I'll perform the edit programmatically to ensure correct formatting.\n\n```bash\npython - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/query.py')\ns = p.read_text()\n\n# Add UniqueConstraint to the django.db.models import line.\ns = s.replace(\n    \"from django.db.models import AutoField, DateField, DateTimeField, sql\",\n    \"from django.db.models import AutoField, DateField, DateTimeField, UniqueConstraint, sql\"\n)\n\n# Replace the uniqueness check in in_bulk to also consider UniqueConstraint on a single field.\nold = (\n    \"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\\n\"\n    \"            raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\\n\"\n)\n\nnew = (\n    \"        if field_name != 'pk':\\n\"\n    \"            field = self.model._meta.get_field(field_name)\\n\"\n    \"            if not field.unique:\\n\"\n    \"                # The field may be unique due to a UniqueConstraint in the model's Meta.constraints.\\n\"\n    \"                for constraint in getattr(self.model._meta, 'constraints', ()): \\n\"\n    \"                    if isinstance(constraint, UniqueConstraint) and list(getattr(constraint, 'fields', [])) == [field_name]:\\n\"\n    \"                        break\\n\"\n    \"                else:\\n\"\n    \"                    raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\\n\"\n)\n\nif old in s:\n    s = s.replace(old, new, 1)\nelse:\n    # Fallback: try to replace a slightly different spacing variant\n    import re\n    pattern = re.compile(r\"if field_name != 'pk' and not self\\.model\\._meta\\.get_field\\(field_name\\)\\.unique:\\s+raise ValueError\\([^\\n]+\\)\\n\")\n    if pattern.search(s):\n        s = pattern.sub(new, s, count=1)\n    else:\n        raise SystemExit(\"Pattern to replace not found. Aborting.\")\n\np.write_text(s)\nprint(\"Patched django/db/models/query.py\")\nPY\n```",
-                  "type": "output_text",
-                  "logprobs": []
-                }
-              ],
-              "role": "assistant",
-              "status": "completed",
-              "type": "message"
-            }
-          ],
-          "parallel_tool_calls": true,
-          "temperature": 1.0,
-          "tool_choice": "auto",
-          "tools": [],
-          "top_p": 1.0,
-          "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688b4f72b881998591f052c43ac8bf",
-          "reasoning": {
-            "effort": "high",
-            "summary": null
-          },
-          "status": "completed",
-          "text": {
-            "format": {
-              "type": "text"
-            },
-            "verbosity": "medium"
-          },
-          "truncation": "disabled",
-          "usage": {
-            "input_tokens": 6177,
-            "input_tokens_details": {
-              "audio_tokens": null,
-              "cached_tokens": 1792,
-              "text_tokens": null
-            },
-            "output_tokens": 3116,
-            "output_tokens_details": {
-              "reasoning_tokens": 2560,
-              "text_tokens": null
-            },
-            "total_tokens": 9293,
-            "cost": null
-          },
-          "user": null,
-          "store": true,
-          "background": false,
-          "billing": {
-            "payer": "developer"
-          },
-          "completed_at": 1768459143,
-          "frequency_penalty": 0.0,
-          "max_tool_calls": null,
-          "presence_penalty": 0.0,
-          "prompt_cache_key": null,
-          "prompt_cache_retention": null,
-          "safety_identifier": null,
-          "service_tier": "default",
-          "top_logprobs": 0
-        }
-      }
-    },
-    {
-      "role": "user",
-      "content": "<returncode>0</returncode>\n<output>\nPatched django/db/models/query.py\n</output>",
-      "timestamp": 1768459143.6807344
-    },
-    {
-      "role": "assistant",
-      "content": "THOUGHT: I will run the test that reproduces the in_bulk behavior: create a small script that defines the Article model with a UniqueConstraint on slug and calls in_bulk(field_name='slug') to verify that it no longer raises the ValueError. I'll create and run the script using Django standalone settings pointing to a temporary SQLite database.\n\n```bash\ncat <<'PY' > test_in_bulk.py\nimport os\nimport django\nfrom django.conf import settings\nfrom django.db import models\n\nBASE_DIR = os.path.dirname(__file__)\nif not settings.configured:\n    settings.configure(\n        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n        INSTALLED_APPS=['test_app'],\n        SECRET_KEY='test',\n    )\n\n# Create a minimal app config\nimport types\napps = types.SimpleNamespace()\ndjango.setup()\n\nclass Article(models.Model):\n    slug = models.CharField(max_length=255)\n\n    class Meta:\n        app_label = 'test_app'\n        constraints = [\n            models.UniqueConstraint(fields=['slug'], name='testapp_article_slug_unq')\n        ]\n\n# Create tables\nfrom django.db import connection\nwith connection.schema_editor() as editor:\n    editor.create_model(Article)\n\n# Create some objects\nArticle.objects.create(slug='a')\nArticle.objects.create(slug='b')\n\n# Call in_bulk by slug\nprint(Article.objects.in_bulk(field_name='slug'))\nPY\npython test_in_bulk.py\n```",
-      "timestamp": 1768459148.8643878,
-      "extra": {
-        "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiODdhMDM4ODE5OWIwMzMzZjQwZDY0NzQ5MTY=",
-          "created_at": 1768459144,
-          "error": null,
-          "incomplete_details": null,
-          "instructions": null,
-          "metadata": {},
-          "model": "gpt-5-mini-2025-08-07",
-          "object": "response",
-          "output": [
-            {
-              "id": "msg_070dfff7bcf67f380069688b8870d481998af26c82b381aab7",
-              "content": [
-                {
-                  "annotations": [],
-                  "text": "THOUGHT: I will run the test that reproduces the in_bulk behavior: create a small script that defines the Article model with a UniqueConstraint on slug and calls in_bulk(field_name='slug') to verify that it no longer raises the ValueError. I'll create and run the script using Django standalone settings pointing to a temporary SQLite database.\n\n```bash\ncat <<'PY' > test_in_bulk.py\nimport os\nimport django\nfrom django.conf import settings\nfrom django.db import models\n\nBASE_DIR = os.path.dirname(__file__)\nif not settings.configured:\n    settings.configure(\n        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n        INSTALLED_APPS=['test_app'],\n        SECRET_KEY='test',\n    )\n\n# Create a minimal app config\nimport types\napps = types.SimpleNamespace()\ndjango.setup()\n\nclass Article(models.Model):\n    slug = models.CharField(max_length=255)\n\n    class Meta:\n        app_label = 'test_app'\n        constraints = [\n            models.UniqueConstraint(fields=['slug'], name='testapp_article_slug_unq')\n        ]\n\n# Create tables\nfrom django.db import connection\nwith connection.schema_editor() as editor:\n    editor.create_model(Article)\n\n# Create some objects\nArticle.objects.create(slug='a')\nArticle.objects.create(slug='b')\n\n# Call in_bulk by slug\nprint(Article.objects.in_bulk(field_name='slug'))\nPY\npython test_in_bulk.py\n```",
-                  "type": "output_text",
-                  "logprobs": []
-                }
-              ],
-              "role": "assistant",
-              "status": "completed",
-              "type": "message"
-            }
-          ],
-          "parallel_tool_calls": true,
-          "temperature": 1.0,
-          "tool_choice": "auto",
-          "tools": [],
-          "top_p": 1.0,
-          "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688b57233481999fb1391afecd1fd1",
-          "reasoning": {
-            "effort": "high",
-            "summary": null
-          },
-          "status": "completed",
-          "text": {
-            "format": {
-              "type": "text"
-            },
-            "verbosity": "medium"
-          },
-          "truncation": "disabled",
-          "usage": {
-            "input_tokens": 6760,
+            "input_tokens": 6136,
             "input_tokens_details": {
               "audio_tokens": null,
               "cached_tokens": 6016,
               "text_tokens": null
             },
-            "output_tokens": 307,
+            "output_tokens": 341,
             "output_tokens_details": {
-              "reasoning_tokens": 0,
+              "reasoning_tokens": 256,
               "text_tokens": null
             },
-            "total_tokens": 7067,
+            "total_tokens": 6477,
             "cost": null
           },
           "user": null,
@@ -644,7 +644,7 @@
           "billing": {
             "payer": "developer"
           },
-          "completed_at": 1768459148,
+          "completed_at": 1768469843,
           "frequency_penalty": 0.0,
           "max_tool_calls": null,
           "presence_penalty": 0.0,
@@ -658,17 +658,17 @@
     },
     {
       "role": "user",
-      "content": "<returncode>1</returncode>\n<output>\nTraceback (most recent call last):\n  File \"test_in_bulk.py\", line 17, in <module>\n    django.setup()\n  File \"/testbed/django/__init__.py\", line 24, in setup\n    apps.populate(settings.INSTALLED_APPS)\n  File \"/testbed/django/apps/registry.py\", line 91, in populate\n    app_config = AppConfig.create(entry)\n  File \"/testbed/django/apps/config.py\", line 90, in create\n    module = import_module(entry)\n  File \"/opt/miniconda3/envs/testbed/lib/python3.6/importlib/__init__.py\", line 126, in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n  File \"<frozen importlib._bootstrap>\", line 994, in _gcd_import\n  File \"<frozen importlib._bootstrap>\", line 971, in _find_and_load\n  File \"<frozen importlib._bootstrap>\", line 953, in _find_and_load_unlocked\nModuleNotFoundError: No module named 'test_app'\n</output>",
-      "timestamp": 1768459149.4056504
+      "content": "<returncode>0</returncode>\n<output>\n     1\tfrom django.db.models.query_utils import Q\n     2\tfrom django.db.models.sql.query import Query\n     3\t\n     4\t__all__ = ['CheckConstraint', 'UniqueConstraint']\n     5\t\n     6\t\n     7\tclass BaseConstraint:\n     8\t    def __init__(self, name):\n     9\t        self.name = name\n    10\t\n    11\t    def constraint_sql(self, model, schema_editor):\n    12\t        raise NotImplementedError('This method must be implemented by a subclass.')\n    13\t\n    14\t    def create_sql(self, model, schema_editor):\n    15\t        raise NotImplementedError('This method must be implemented by a subclass.')\n    16\t\n    17\t    def remove_sql(self, model, schema_editor):\n    18\t        raise NotImplementedError('This method must be implemented by a subclass.')\n    19\t\n    20\t    def deconstruct(self):\n    21\t        path = '%s.%s' % (self.__class__.__module__, self.__class__.__name__)\n    22\t        path = path.replace('django.db.models.constraints', 'django.db.models')\n    23\t        return (path, (), {'name': self.name})\n    24\t\n    25\t    def clone(self):\n    26\t        _, args, kwargs = self.deconstruct()\n    27\t        return self.__class__(*args, **kwargs)\n    28\t\n    29\t\n    30\tclass CheckConstraint(BaseConstraint):\n    31\t    def __init__(self, *, check, name):\n    32\t        self.check = check\n    33\t        if not getattr(check, 'conditional', False):\n    34\t            raise TypeError(\n    35\t                'CheckConstraint.check must be a Q instance or boolean '\n    36\t                'expression.'\n    37\t            )\n    38\t        super().__init__(name)\n    39\t\n    40\t    def _get_check_sql(self, model, schema_editor):\n    41\t        query = Query(model=model, alias_cols=False)\n    42\t        where = query.build_where(self.check)\n    43\t        compiler = query.get_compiler(connection=schema_editor.connection)\n    44\t        sql, params = where.as_sql(compiler, schema_editor.connection)\n    45\t        return sql % tuple(schema_editor.quote_value(p) for p in params)\n    46\t\n    47\t    def constraint_sql(self, model, schema_editor):\n    48\t        check = self._get_check_sql(model, schema_editor)\n    49\t        return schema_editor._check_sql(self.name, check)\n    50\t\n    51\t    def create_sql(self, model, schema_editor):\n    52\t        check = self._get_check_sql(model, schema_editor)\n    53\t        return schema_editor._create_check_sql(model, self.name, check)\n    54\t\n    55\t    def remove_sql(self, model, schema_editor):\n    56\t        return schema_editor._delete_check_sql(model, self.name)\n    57\t\n    58\t    def __repr__(self):\n    59\t        return \"<%s: check='%s' name=%r>\" % (self.__class__.__name__, self.check, self.name)\n    60\t\n    61\t    def __eq__(self, other):\n    62\t        if isinstance(other, CheckConstraint):\n    63\t            return self.name == other.name and self.check == other.check\n    64\t        return super().__eq__(other)\n    65\t\n    66\t    def deconstruct(self):\n    67\t        path, args, kwargs = super().deconstruct()\n    68\t        kwargs['check'] = self.check\n    69\t        return path, args, kwargs\n    70\t\n    71\t\n    72\tclass UniqueConstraint(BaseConstraint):\n    73\t    def __init__(self, *, fields, name, condition=None):\n    74\t        if not fields:\n    75\t            raise ValueError('At least one field is required to define a unique constraint.')\n    76\t        if not isinstance(condition, (type(None), Q)):\n    77\t            raise ValueError('UniqueConstraint.condition must be a Q instance.')\n    78\t        self.fields = tuple(fields)\n    79\t        self.condition = condition\n    80\t        super().__init__(name)\n    81\t\n    82\t    def _get_condition_sql(self, model, schema_editor):\n    83\t        if self.condition is None:\n    84\t            return None\n    85\t        query = Query(model=model, alias_cols=False)\n    86\t        where = query.build_where(self.condition)\n    87\t        compiler = query.get_compiler(connection=schema_editor.connection)\n    88\t        sql, params = where.as_sql(compiler, schema_editor.connection)\n    89\t        return sql % tuple(schema_editor.quote_value(p) for p in params)\n    90\t\n    91\t    def constraint_sql(self, model, schema_editor):\n    92\t        fields = [model._meta.get_field(field_name).column for field_name in self.fields]\n    93\t        condition = self._get_condition_sql(model, schema_editor)\n    94\t        return schema_editor._unique_sql(model, fields, self.name, condition=condition)\n    95\t\n    96\t    def create_sql(self, model, schema_editor):\n    97\t        fields = [model._meta.get_field(field_name).column for field_name in self.fields]\n    98\t        condition = self._get_condition_sql(model, schema_editor)\n    99\t        return schema_editor._create_unique_sql(model, fields, self.name, condition=condition)\n   100\t\n   101\t    def remove_sql(self, model, schema_editor):\n   102\t        condition = self._get_condition_sql(model, schema_editor)\n   103\t        return schema_editor._delete_unique_sql(model, self.name, condition=condition)\n   104\t\n   105\t    def __repr__(self):\n   106\t        return '<%s: fields=%r name=%r%s>' % (\n   107\t            self.__class__.__name__, self.fields, self.name,\n   108\t            '' if self.condition is None else ' condition=%s' % self.condition,\n   109\t        )\n   110\t\n   111\t    def __eq__(self, other):\n   112\t        if isinstance(other, UniqueConstraint):\n   113\t            return (\n   114\t                self.name == other.name and\n   115\t                self.fields == other.fields and\n   116\t                self.condition == other.condition\n   117\t            )\n   118\t        return super().__eq__(other)\n   119\t\n   120\t    def deconstruct(self):\n   121\t        path, args, kwargs = super().deconstruct()\n   122\t        kwargs['fields'] = self.fields\n   123\t        if self.condition:\n   124\t            kwargs['condition'] = self.condition\n   125\t        return path, args, kwargs\n</output>",
+      "timestamp": 1768469844.3443274
     },
     {
       "role": "assistant",
-      "content": "THOUGHT: The test failed because the dummy app 'test_app' referenced in INSTALLED_APPS doesn't exist. I'll create a minimal test_app package (with __init__.py and apps.py) so Django can import it during setup, then re-run the test script to verify in_bulk works with a UniqueConstraint on slug.\n\n```bash\nmkdir -p test_app && cat > test_app/__init__.py <<'PY'\ndefault_app_config = 'test_app.apps.TestAppConfig'\nPY\n&& cat > test_app/apps.py <<'PY'\nfrom django.apps import AppConfig\n\nclass TestAppConfig(AppConfig):\n    name = 'test_app'\n    label = 'test_app'\nPY\n&& python test_in_bulk.py\n```",
-      "timestamp": 1768459178.9515617,
+      "content": "THOUGHT: I'll search the tests for \"UniqueConstraint\" and for model Meta.constraints usage to find tests that define a unique constraint on a field (e.g., slug) and expect in_bulk to accept it. This will show how strict the change should be (e.g., ignore conditional constraints).\n\n```bash\ngrep -R --line-number \"UniqueConstraint\" -n tests || true\n```",
+      "timestamp": 1768469847.7642167,
       "extra": {
         "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiOGQ1ZGE0ODE5OWE5ODZkNTAyNmI4NGI3ZmQ=",
-          "created_at": 1768459149,
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NTQ0ZDc4ODE5Njg1NGM5OGQxYzI2NDFmYmY=",
+          "created_at": 1768469844,
           "error": null,
           "incomplete_details": null,
           "instructions": null,
@@ -677,7 +677,7 @@
           "object": "response",
           "output": [
             {
-              "id": "rs_070dfff7bcf67f380069688b8f421c8199b3882efcb8c35322",
+              "id": "rs_049e3d1940643cf9006968b554d3f08196b804475e08425500",
               "summary": [],
               "type": "reasoning",
               "content": null,
@@ -685,11 +685,11 @@
               "status": null
             },
             {
-              "id": "msg_070dfff7bcf67f380069688ba88cfc8199944f8eea5850b841",
+              "id": "msg_049e3d1940643cf9006968b55627cc8196950d34de628b1fb8",
               "content": [
                 {
                   "annotations": [],
-                  "text": "THOUGHT: The test failed because the dummy app 'test_app' referenced in INSTALLED_APPS doesn't exist. I'll create a minimal test_app package (with __init__.py and apps.py) so Django can import it during setup, then re-run the test script to verify in_bulk works with a UniqueConstraint on slug.\n\n```bash\nmkdir -p test_app && cat > test_app/__init__.py <<'PY'\ndefault_app_config = 'test_app.apps.TestAppConfig'\nPY\n&& cat > test_app/apps.py <<'PY'\nfrom django.apps import AppConfig\n\nclass TestAppConfig(AppConfig):\n    name = 'test_app'\n    label = 'test_app'\nPY\n&& python test_in_bulk.py\n```",
+                  "text": "THOUGHT: I'll search the tests for \"UniqueConstraint\" and for model Meta.constraints usage to find tests that define a unique constraint on a field (e.g., slug) and expect in_bulk to accept it. This will show how strict the change should be (e.g., ignore conditional constraints).\n\n```bash\ngrep -R --line-number \"UniqueConstraint\" -n tests || true\n```",
                   "type": "output_text",
                   "logprobs": []
                 }
@@ -705,7 +705,7 @@
           "tools": [],
           "top_p": 1.0,
           "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688b87a0388199b0333f40d6474916",
+          "previous_response_id": "resp_049e3d1940643cf9006968b54f29ac8196be17f8b87250a80b",
           "reasoning": {
             "effort": "high",
             "summary": null
@@ -719,18 +719,129 @@
           },
           "truncation": "disabled",
           "usage": {
-            "input_tokens": 7319,
+            "input_tokens": 7702,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 6016,
+              "text_tokens": null
+            },
+            "output_tokens": 215,
+            "output_tokens_details": {
+              "reasoning_tokens": 128,
+              "text_tokens": null
+            },
+            "total_tokens": 7917,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768469847,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\ntests/migrations/test_operations.py:352:        partial_unique_constraint = models.UniqueConstraint(\ntests/migrations/test_operations.py:1942:        partial_unique_constraint = models.UniqueConstraint(\ntests/migrations/test_operations.py:1984:            models.UniqueConstraint(\ntests/constraints/tests.py:9:    ChildModel, Product, UniqueConstraintConditionProduct,\ntests/constraints/tests.py:10:    UniqueConstraintProduct,\ntests/constraints/tests.py:119:class UniqueConstraintTests(TestCase):\ntests/constraints/tests.py:122:        cls.p1, cls.p2 = UniqueConstraintProduct.objects.bulk_create([\ntests/constraints/tests.py:123:            UniqueConstraintProduct(name='p1', color='red'),\ntests/constraints/tests.py:124:            UniqueConstraintProduct(name='p2'),\ntests/constraints/tests.py:129:            models.UniqueConstraint(fields=['foo', 'bar'], name='unique'),\ntests/constraints/tests.py:130:            models.UniqueConstraint(fields=['foo', 'bar'], name='unique'),\ntests/constraints/tests.py:133:            models.UniqueConstraint(fields=['foo', 'bar'], name='unique'),\ntests/constraints/tests.py:137:            models.UniqueConstraint(fields=['foo', 'bar'], name='unique'),\ntests/constraints/tests.py:138:            models.UniqueConstraint(fields=['foo', 'bar'], name='unique2'),\ntests/constraints/tests.py:141:            models.UniqueConstraint(fields=['foo', 'bar'], name='unique'),\ntests/constraints/tests.py:142:            models.UniqueConstraint(fields=['foo', 'baz'], name='unique'),\ntests/constraints/tests.py:144:        self.assertNotEqual(models.UniqueConstraint(fields=['foo', 'bar'], name='unique'), 1)\ntests/constraints/tests.py:148:            models.UniqueConstraint(\ntests/constraints/tests.py:152:            models.UniqueConstraint(\ntests/constraints/tests.py:157:            models.UniqueConstraint(\ntests/constraints/tests.py:162:            models.UniqueConstraint(\ntests/constraints/tests.py:172:        constraint = models.UniqueConstraint(fields=fields, name=name)\ntests/constraints/tests.py:175:            \"<UniqueConstraint: fields=('foo', 'bar') name='unique_fields'>\",\ntests/constraints/tests.py:179:        constraint = models.UniqueConstraint(\ntests/constraints/tests.py:186:            \"<UniqueConstraint: fields=('foo', 'bar') name='unique_fields' \"\ntests/constraints/tests.py:193:        constraint = models.UniqueConstraint(fields=fields, name=name)\ntests/constraints/tests.py:195:        self.assertEqual(path, 'django.db.models.UniqueConstraint')\ntests/constraints/tests.py:203:        constraint = models.UniqueConstraint(fields=fields, name=name, condition=condition)\ntests/constraints/tests.py:205:        self.assertEqual(path, 'django.db.models.UniqueConstraint')\ntests/constraints/tests.py:211:            UniqueConstraintProduct.objects.create(name=self.p1.name, color=self.p1.color)\ntests/constraints/tests.py:215:        UniqueConstraintConditionProduct.objects.create(name='p1')\ntests/constraints/tests.py:216:        UniqueConstraintConditionProduct.objects.create(name='p2')\ntests/constraints/tests.py:218:            UniqueConstraintConditionProduct.objects.create(name='p1')\ntests/constraints/tests.py:223:            UniqueConstraintProduct(name=self.p1.name, color=self.p1.color).validate_unique()\ntests/constraints/tests.py:228:        obj1 = UniqueConstraintConditionProduct.objects.create(name='p1', color='red')\ntests/constraints/tests.py:229:        obj2 = UniqueConstraintConditionProduct.objects.create(name='p2')\ntests/constraints/tests.py:230:        UniqueConstraintConditionProduct(name=obj1.name, color='blue').validate_unique()\ntests/constraints/tests.py:231:        UniqueConstraintConditionProduct(name=obj2.name).validate_unique()\ntests/constraints/tests.py:234:        constraints = get_constraints(UniqueConstraintProduct._meta.db_table)\ntests/constraints/tests.py:239:        with self.assertRaisesMessage(ValueError, 'UniqueConstraint.condition must be a Q instance.'):\ntests/constraints/tests.py:240:            models.UniqueConstraint(name='uniq', fields=['name'], condition='invalid')\ntests/constraints/models.py:37:class UniqueConstraintProduct(models.Model):\ntests/constraints/models.py:43:            models.UniqueConstraint(fields=['name', 'color'], name='name_color_uniq'),\ntests/constraints/models.py:47:class UniqueConstraintConditionProduct(models.Model):\ntests/constraints/models.py:54:            models.UniqueConstraint(\ntests/admin_inlines/models.py:115:            models.UniqueConstraint(fields=['dummy', 'holder'], name='unique_stacked_dummy_per_holder')\ntests/admin_inlines/models.py:125:            models.UniqueConstraint(fields=['dummy', 'holder'], name='unique_tabular_dummy_per_holder')\ntests/admin_changelist/tests.py:1086:                        models.UniqueConstraint(fields=fields, name=''.join(fields))\ntests/admin_changelist/tests.py:1099:                    models.UniqueConstraint(\ntests/admin_changelist/tests.py:1104:                    models.UniqueConstraint(\ntests/introspection/models.py:65:            models.UniqueConstraint(fields=['article', 'email', 'pub_date'], name='article_email_pub_date_uniq'),\ntests/invalid_models_tests/test_models.py:1380:                    models.UniqueConstraint(\ntests/invalid_models_tests/test_models.py:1409:                    models.UniqueConstraint(\ntests/invalid_models_tests/test_relative_fields.py:386:                    'Add unique=True to this field or add a UniqueConstraint '\ntests/invalid_models_tests/test_relative_fields.py:406:                    'Add unique=True to this field or add a UniqueConstraint '\ntests/invalid_models_tests/test_relative_fields.py:420:                    models.UniqueConstraint(\ntests/invalid_models_tests/test_relative_fields.py:436:                    'Add unique=True to this field or add a UniqueConstraint '\ntests/invalid_models_tests/test_relative_fields.py:450:                    models.UniqueConstraint(\ntests/invalid_models_tests/test_relative_fields.py:486:                    'UniqueConstraint (without condition) in the model '\ntests/invalid_models_tests/test_relative_fields.py:501:                    models.UniqueConstraint(\ntests/invalid_models_tests/test_relative_fields.py:526:                    'UniqueConstraint (without condition) in the model '\ntests/invalid_models_tests/test_relative_fields.py:541:                    models.UniqueConstraint(\ntests/invalid_models_tests/test_relative_fields.py:1611:                    'UniqueConstraint (without condition) in the model '\ntests/invalid_models_tests/test_relative_fields.py:1649:                    'UniqueConstraint (without condition) in the model '\ntests/schema/tests.py:16:    SmallIntegerField, TextField, TimeField, UniqueConstraint, UUIDField,\ntests/schema/tests.py:1968:        constraint = UniqueConstraint(fields=['name'], name='author_name_uniq')\ntests/schema/tests.py:2087:        constraint = UniqueConstraint(fields=['name', 'birthday'], name='author_name_birthday_uniq')\n</output>",
+      "timestamp": 1768469847.9509401
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I'll inspect the model Options implementation to see if there's an existing place that represents constraints or helper methods that I should use when checking for uniqueness via UniqueConstraint.\n\n```bash\nnl -ba django/db/models/options.py | sed -n '1,360p'\n```",
+      "timestamp": 1768469856.4118252,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NTdlNDI4ODE5NmI4ZWNmZDdkNjg0MjMyMzA=",
+          "created_at": 1768469848,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_049e3d1940643cf9006968b558cf5c819694250fe3209ecc89",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_049e3d1940643cf9006968b55e0b5c8196843a75129996fd35",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "rs_049e3d1940643cf9006968b55e22d08196920f92bf0f64b544",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_049e3d1940643cf9006968b55f180c8196a96f77f7de2921ce",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "THOUGHT: I'll inspect the model Options implementation to see if there's an existing place that represents constraints or helper methods that I should use when checking for uniqueness via UniqueConstraint.\n\n```bash\nnl -ba django/db/models/options.py | sed -n '1,360p'\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_049e3d1940643cf9006968b5544d788196854c98d1c2641fbf",
+          "reasoning": {
+            "effort": "high",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 9244,
             "input_tokens_details": {
               "audio_tokens": null,
               "cached_tokens": 0,
               "text_tokens": null
             },
-            "output_tokens": 2141,
+            "output_tokens": 511,
             "output_tokens_details": {
-              "reasoning_tokens": 1984,
+              "reasoning_tokens": 448,
               "text_tokens": null
             },
-            "total_tokens": 9460,
+            "total_tokens": 9755,
             "cost": null
           },
           "user": null,
@@ -739,7 +850,7 @@
           "billing": {
             "payer": "developer"
           },
-          "completed_at": 1768459178,
+          "completed_at": 1768469856,
           "frequency_penalty": 0.0,
           "max_tool_calls": null,
           "presence_penalty": 0.0,
@@ -753,17 +864,17 @@
     },
     {
       "role": "user",
-      "content": "<returncode>2</returncode>\n<output>\nbash: -c: line 4: syntax error near unexpected token `&&'\nbash: -c: line 4: `&& cat > test_app/apps.py <<'PY''\n</output>",
-      "timestamp": 1768459179.1398206
+      "content": "<returncode>0</returncode>\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning><output_head>\n     1\timport bisect\n     2\timport copy\n     3\timport inspect\n     4\tfrom collections import defaultdict\n     5\t\n     6\tfrom django.apps import apps\n     7\tfrom django.conf import settings\n     8\tfrom django.core.exceptions import FieldDoesNotExist\n     9\tfrom django.db import connections\n    10\tfrom django.db.models import AutoField, Manager, OrderWrt, UniqueConstraint\n    11\tfrom django.db.models.query_utils import PathInfo\n    12\tfrom django.utils.datastructures import ImmutableList, OrderedSet\n    13\tfrom django.utils.functional import cached_property\n    14\tfrom django.utils.text import camel_case_to_spaces, format_lazy\n    15\tfrom django.utils.translation import override\n    16\t\n    17\tPROXY_PARENTS = object()\n    18\t\n    19\tEMPTY_RELATION_TREE = ()\n    20\t\n    21\tIMMUTABLE_WARNING = (\n    22\t    \"The return type of '%s' should never be mutated. If you want to manipulate this list \"\n    23\t    \"for your own use, make a copy first.\"\n    24\t)\n    25\t\n    26\tDEFAULT_NAMES = (\n    27\t    'verbose_name', 'verbose_name_plural', 'db_table', 'ordering',\n    28\t    'unique_together', 'permissions', 'get_latest_by', 'order_with_respect_to',\n    29\t    'app_label', 'db_tablespace', 'abstract', 'managed', 'proxy', 'swappable',\n    30\t    'auto_created', 'index_together', 'apps', 'default_permissions',\n    31\t    'select_on_save', 'default_related_name', 'required_db_features',\n    32\t    'required_db_vendor', 'base_manager_name', 'default_manager_name',\n    33\t    'indexes', 'constraints',\n    34\t)\n    35\t\n    36\t\n    37\tdef normalize_together(option_together):\n    38\t    \"\"\"\n    39\t    option_together can be either a tuple of tuples, or a single\n    40\t    tuple of two strings. Normalize it to a tuple of tuples, so that\n    41\t    calling code can uniformly expect that.\n    42\t    \"\"\"\n    43\t    try:\n    44\t        if not option_together:\n    45\t            return ()\n    46\t        if not isinstance(option_together, (tuple, list)):\n    47\t            raise TypeError\n    48\t        first_element = option_together[0]\n    49\t        if not isinstance(first_element, (tuple, list)):\n    50\t            option_together = (option_together,)\n    51\t        # Normalize everything to tuples\n    52\t        return tuple(tuple(ot) for ot in option_together)\n    53\t    except TypeError:\n    54\t        # If the value of option_together isn't valid, return it\n    55\t        # verbatim; this will be picked up by the check framework later.\n    56\t        return option_together\n    57\t\n    58\t\n    59\tdef make_immutable_fields_list(name, data):\n    60\t    return ImmutableList(data, warning=IMMUTABLE_WARNING % name)\n    61\t\n    62\t\n    63\tclass Options:\n    64\t    FORWARD_PROPERTIES = {\n    65\t        'fields', 'many_to_many', 'concrete_fields', 'local_concrete_fields',\n    66\t        '_forward_fields_map', 'managers', 'managers_map', 'base_manager',\n    67\t        'default_manager',\n    68\t    }\n    69\t    REVERSE_PROPERTIES = {'related_objects', 'fields_map', '_relation_tree'}\n    70\t\n    71\t    default_apps = apps\n    72\t\n    73\t    def __init__(self, meta, app_label=None):\n    74\t        self._get_fields_cache = {}\n    75\t        self.local_fields = []\n    76\t        self.local_many_to_many = []\n    77\t        self.private_fields = []\n    78\t        self.local_managers = []\n    79\t        self.base_manager_name = None\n    80\t        self.default_manager_name = None\n    81\t        self.model_name = None\n    82\t        self.verbose_name = None\n    83\t        self.verbose_name_plural = None\n    84\t        self.db_table = ''\n    85\t        self.ordering = []\n    86\t        self._ordering_clash = False\n    87\t        self.indexes = []\n    88\t        self.constraints = []\n    89\t        self.unique_together = []\n    90\t        self.index_together = []\n    91\t        self.select_on_save = False\n    92\t        self.default_permissions = ('add', 'change', 'delete', 'view')\n    93\t        self.permissions = []\n    94\t        self.object_name = None\n    95\t        self.app_label = app_label\n    96\t        self.get_latest_by = None\n    97\t        self.order_with_respect_to = None\n    98\t        self.db_tablespace = settings.DEFAULT_TABLESPACE\n    99\t        self.required_db_features = []\n   100\t        self.required_db_vendor = None\n   101\t        self.meta = meta\n   102\t        self.pk = None\n   103\t        self.auto_field = None\n   104\t        self.abstract = False\n   105\t        self.managed = True\n   106\t        self.proxy = False\n   107\t        # For any class that is a proxy (including automatically created\n   108\t        # classes for deferred object loading), proxy_for_model tells us\n   109\t        # which class this model is proxying. Note that proxy_for_model\n   110\t        # can create a chain of proxy models. For non-proxy models, the\n   111\t        # variable is always None.\n   112\t        self.proxy_for_model = None\n   113\t        # For any non-abstract class, the concrete class is the model\n   114\t        # in the end of the p\n</output_head>\n<elided_chars>\n6973 characters elided\n</elided_chars>\n<output_tail>\nose_name='ID', primary_key=True, auto_created=True)\n   254\t                model.add_to_class('id', auto)\n   255\t\n   256\t    def add_manager(self, manager):\n   257\t        self.local_managers.append(manager)\n   258\t        self._expire_cache()\n   259\t\n   260\t    def add_field(self, field, private=False):\n   261\t        # Insert the given field in the order in which it was created, using\n   262\t        # the \"creation_counter\" attribute of the field.\n   263\t        # Move many-to-many related fields from self.fields into\n   264\t        # self.many_to_many.\n   265\t        if private:\n   266\t            self.private_fields.append(field)\n   267\t        elif field.is_relation and field.many_to_many:\n   268\t            bisect.insort(self.local_many_to_many, field)\n   269\t        else:\n   270\t            bisect.insort(self.local_fields, field)\n   271\t            self.setup_pk(field)\n   272\t\n   273\t        # If the field being added is a relation to another known field,\n   274\t        # expire the cache on this field and the forward cache on the field\n   275\t        # being referenced, because there will be new relationships in the\n   276\t        # cache. Otherwise, expire the cache of references *to* this field.\n   277\t        # The mechanism for getting at the related model is slightly odd -\n   278\t        # ideally, we'd just ask for field.related_model. However, related_model\n   279\t        # is a cached property, and all the models haven't been loaded yet, so\n   280\t        # we need to make sure we don't cache a string reference.\n   281\t        if field.is_relation and hasattr(field.remote_field, 'model') and field.remote_field.model:\n   282\t            try:\n   283\t                field.remote_field.model._meta._expire_cache(forward=False)\n   284\t            except AttributeError:\n   285\t                pass\n   286\t            self._expire_cache()\n   287\t        else:\n   288\t            self._expire_cache(reverse=False)\n   289\t\n   290\t    def setup_pk(self, field):\n   291\t        if not self.pk and field.primary_key:\n   292\t            self.pk = field\n   293\t            field.serialize = False\n   294\t\n   295\t    def setup_proxy(self, target):\n   296\t        \"\"\"\n   297\t        Do the internal setup so that the current model is a proxy for\n   298\t        \"target\".\n   299\t        \"\"\"\n   300\t        self.pk = target._meta.pk\n   301\t        self.proxy_for_model = target\n   302\t        self.db_table = target._meta.db_table\n   303\t\n   304\t    def __repr__(self):\n   305\t        return '<Options for %s>' % self.object_name\n   306\t\n   307\t    def __str__(self):\n   308\t        return self.label_lower\n   309\t\n   310\t    def can_migrate(self, connection):\n   311\t        \"\"\"\n   312\t        Return True if the model can/should be migrated on the `connection`.\n   313\t        `connection` can be either a real connection or a connection alias.\n   314\t        \"\"\"\n   315\t        if self.proxy or self.swapped or not self.managed:\n   316\t            return False\n   317\t        if isinstance(connection, str):\n   318\t            connection = connections[connection]\n   319\t        if self.required_db_vendor:\n   320\t            return self.required_db_vendor == connection.vendor\n   321\t        if self.required_db_features:\n   322\t            return all(getattr(connection.features, feat, False)\n   323\t                       for feat in self.required_db_features)\n   324\t        return True\n   325\t\n   326\t    @property\n   327\t    def verbose_name_raw(self):\n   328\t        \"\"\"Return the untranslated verbose name.\"\"\"\n   329\t        with override(None):\n   330\t            return str(self.verbose_name)\n   331\t\n   332\t    @property\n   333\t    def swapped(self):\n   334\t        \"\"\"\n   335\t        Has this model been swapped out for another? If so, return the model\n   336\t        name of the replacement; otherwise, return None.\n   337\t\n   338\t        For historical reasons, model name lookups using get_model() are\n   339\t        case insensitive, so we make sure we are case insensitive here.\n   340\t        \"\"\"\n   341\t        if self.swappable:\n   342\t            swapped_for = getattr(settings, self.swappable, None)\n   343\t            if swapped_for:\n   344\t                try:\n   345\t                    swapped_label, swapped_object = swapped_for.split('.')\n   346\t                except ValueError:\n   347\t                    # setting not in the format app_label.model_name\n   348\t                    # raising ImproperlyConfigured here causes problems with\n   349\t                    # test cleanup code - instead it is raised in get_user_model\n   350\t                    # or as part of validation.\n   351\t                    return swapped_for\n   352\t\n   353\t                if '%s.%s' % (swapped_label, swapped_object.lower()) != self.label_lower:\n   354\t                    return swapped_for\n   355\t        return None\n   356\t\n   357\t    @cached_property\n   358\t    def managers(self):\n   359\t        managers = []\n   360\t        seen_managers = set()\n\n</output_tail>",
+      "timestamp": 1768469856.5930188
     },
     {
       "role": "assistant",
-      "content": "THOUGHT: The previous test failed because the dummy app \"test_app\" wasn't present in INSTALLED_APPS. I'll create a minimal test_app package (with __init__.py and apps.py) so Django can import it during setup, then run the existing test_in_bulk.py script to verify that in_bulk(field_name='slug') no longer raises an error.\n\n```bash\nmkdir -p test_app && printf '%s\\n' \"default_app_config = 'test_app.apps.TestAppConfig'\" > test_app/__init__.py && printf '%s\\n' \"from django.apps import AppConfig\" \"\" \"class TestAppConfig(AppConfig):\" \"    name = 'test_app'\" \"    label = 'test_app'\" > test_app/apps.py && python test_in_bulk.py\n```",
-      "timestamp": 1768459224.4958034,
+      "content": "THOUGHT: I will modify django/db/models/query.py to allow in_bulk to accept a field that is unique via a UniqueConstraint (single-field, without condition). I'll update the uniqueness check to look for a UniqueConstraint in the model's _meta.constraints when field.unique is False. I'll make the change using sed to insert the extra logic. \n\n```bash\nsed -n '1,120p' django/db/models/query.py >/dev/null && sed -n '1,120p' django/db/models/query.py | sed -n '1,1p' && python - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/query.py')\ns = p.read_text()\nold = \"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\\n            raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\"\nif old in s:\n    new = (\"        if field_name != 'pk':\\n\"\n           \"            field = self.model._meta.get_field(field_name)\\n\"\n           \"            is_unique = field.unique\\n\"\n           \"            # Consider a field unique if there's an unconditional UniqueConstraint on it.\\n\"\n           \"            if not is_unique:\\n\"\n           \"                try:\\n\"\n           \"                    from django.db.models import UniqueConstraint\\n\"\n           \"                except Exception:\\n\"\n           \"                    UniqueConstraint = None\\n\"\n           \"                if UniqueConstraint is not None:\\n\"\n           \"                    for constraint in self.model._meta.constraints:\\n\"\n           \"                        if isinstance(constraint, UniqueConstraint) and not constraint.condition and tuple(constraint.fields) == (field_name,):\\n\"\n           \"                            is_unique = True\\n\"\n           \"                            break\\n\"\n           \"            if not is_unique:\\n\"\n           \"                raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\")\n    s = s.replace(old, new)\n    p.write_text(s)\n    print('patched')\nelse:\n    print('pattern not found')\nPY```",
+      "timestamp": 1768469864.8546252,
       "extra": {
         "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiYWIxYTYwODE5OTlmNjIyN2E3MjYyYmQ4OTg=",
-          "created_at": 1768459179,
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NjA4ZTU0ODE5Njg2OWQ4MTBiOTVjMjNiMTY=",
+          "created_at": 1768469856,
           "error": null,
           "incomplete_details": null,
           "instructions": null,
@@ -772,7 +883,7 @@
           "object": "response",
           "output": [
             {
-              "id": "rs_070dfff7bcf67f380069688bab91008199b74553b5fe6f6475",
+              "id": "rs_049e3d1940643cf9006968b56118188196a64f7ea4c1aa96cd",
               "summary": [],
               "type": "reasoning",
               "content": null,
@@ -780,11 +891,11 @@
               "status": null
             },
             {
-              "id": "msg_070dfff7bcf67f380069688bd5a9d881998fa636e29260e5e7",
+              "id": "msg_049e3d1940643cf9006968b5628de48196a1323b3c7a3d0526",
               "content": [
                 {
                   "annotations": [],
-                  "text": "THOUGHT: The previous test failed because the dummy app \"test_app\" wasn't present in INSTALLED_APPS. I'll create a minimal test_app package (with __init__.py and apps.py) so Django can import it during setup, then run the existing test_in_bulk.py script to verify that in_bulk(field_name='slug') no longer raises an error.\n\n```bash\nmkdir -p test_app && printf '%s\\n' \"default_app_config = 'test_app.apps.TestAppConfig'\" > test_app/__init__.py && printf '%s\\n' \"from django.apps import AppConfig\" \"\" \"class TestAppConfig(AppConfig):\" \"    name = 'test_app'\" \"    label = 'test_app'\" > test_app/apps.py && python test_in_bulk.py\n```",
+                  "text": "THOUGHT: I will modify django/db/models/query.py to allow in_bulk to accept a field that is unique via a UniqueConstraint (single-field, without condition). I'll update the uniqueness check to look for a UniqueConstraint in the model's _meta.constraints when field.unique is False. I'll make the change using sed to insert the extra logic. \n\n```bash\nsed -n '1,120p' django/db/models/query.py >/dev/null && sed -n '1,120p' django/db/models/query.py | sed -n '1,1p' && python - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/query.py')\ns = p.read_text()\nold = \"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\\n            raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\"\nif old in s:\n    new = (\"        if field_name != 'pk':\\n\"\n           \"            field = self.model._meta.get_field(field_name)\\n\"\n           \"            is_unique = field.unique\\n\"\n           \"            # Consider a field unique if there's an unconditional UniqueConstraint on it.\\n\"\n           \"            if not is_unique:\\n\"\n           \"                try:\\n\"\n           \"                    from django.db.models import UniqueConstraint\\n\"\n           \"                except Exception:\\n\"\n           \"                    UniqueConstraint = None\\n\"\n           \"                if UniqueConstraint is not None:\\n\"\n           \"                    for constraint in self.model._meta.constraints:\\n\"\n           \"                        if isinstance(constraint, UniqueConstraint) and not constraint.condition and tuple(constraint.fields) == (field_name,):\\n\"\n           \"                            is_unique = True\\n\"\n           \"                            break\\n\"\n           \"            if not is_unique:\\n\"\n           \"                raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\")\n    s = s.replace(old, new)\n    p.write_text(s)\n    print('patched')\nelse:\n    print('pattern not found')\nPY```",
                   "type": "output_text",
                   "logprobs": []
                 }
@@ -800,94 +911,7 @@
           "tools": [],
           "top_p": 1.0,
           "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688b8d5da48199a986d5026b84b7fd",
-          "reasoning": {
-            "effort": "high",
-            "summary": null
-          },
-          "status": "completed",
-          "text": {
-            "format": {
-              "type": "text"
-            },
-            "verbosity": "medium"
-          },
-          "truncation": "disabled",
-          "usage": {
-            "input_tokens": 7533,
-            "input_tokens_details": {
-              "audio_tokens": null,
-              "cached_tokens": 7040,
-              "text_tokens": null
-            },
-            "output_tokens": 2855,
-            "output_tokens_details": {
-              "reasoning_tokens": 2688,
-              "text_tokens": null
-            },
-            "total_tokens": 10388,
-            "cost": null
-          },
-          "user": null,
-          "store": true,
-          "background": false,
-          "billing": {
-            "payer": "developer"
-          },
-          "completed_at": 1768459224,
-          "frequency_penalty": 0.0,
-          "max_tool_calls": null,
-          "presence_penalty": 0.0,
-          "prompt_cache_key": null,
-          "prompt_cache_retention": null,
-          "safety_identifier": null,
-          "service_tier": "default",
-          "top_logprobs": 0
-        }
-      }
-    },
-    {
-      "role": "user",
-      "content": "<returncode>0</returncode>\n<output>\n{'a': <Article: Article object (1)>, 'b': <Article: Article object (2)>}\n</output>",
-      "timestamp": 1768459224.9635742
-    },
-    {
-      "role": "assistant",
-      "content": "THOUGHT: The test shows that in_bulk(field_name='slug') now works with a UniqueConstraint. I'll run repository tests related to query in_bulk if available; but to finish, I need to submit changes. I'll show the final submission command to complete the task.\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
-      "timestamp": 1768459227.5145469,
-      "extra": {
-        "response": {
-          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDcwZGZmZjdiY2Y2N2YzODAwNjk2ODhiZDhlZGUwODE5OWEwMWEyYzFlZjE4OGZmNjU=",
-          "created_at": 1768459225,
-          "error": null,
-          "incomplete_details": null,
-          "instructions": null,
-          "metadata": {},
-          "model": "gpt-5-mini-2025-08-07",
-          "object": "response",
-          "output": [
-            {
-              "id": "msg_070dfff7bcf67f380069688bd992148199b63676347c541971",
-              "content": [
-                {
-                  "annotations": [],
-                  "text": "THOUGHT: The test shows that in_bulk(field_name='slug') now works with a UniqueConstraint. I'll run repository tests related to query in_bulk if available; but to finish, I need to submit changes. I'll show the final submission command to complete the task.\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
-                  "type": "output_text",
-                  "logprobs": []
-                }
-              ],
-              "role": "assistant",
-              "status": "completed",
-              "type": "message"
-            }
-          ],
-          "parallel_tool_calls": true,
-          "temperature": 1.0,
-          "tool_choice": "auto",
-          "tools": [],
-          "top_p": 1.0,
-          "max_output_tokens": null,
-          "previous_response_id": "resp_070dfff7bcf67f380069688bab1a6081999f6227a7262bd898",
+          "previous_response_id": "resp_049e3d1940643cf9006968b557e4288196b8ecfd7d68423230",
           "reasoning": {
             "effort": "low",
             "summary": null
@@ -901,18 +925,18 @@
           },
           "truncation": "disabled",
           "usage": {
-            "input_tokens": 7743,
+            "input_tokens": 11923,
             "input_tokens_details": {
               "audio_tokens": null,
               "cached_tokens": 0,
               "text_tokens": null
             },
-            "output_tokens": 82,
+            "output_tokens": 516,
             "output_tokens_details": {
-              "reasoning_tokens": 0,
+              "reasoning_tokens": 64,
               "text_tokens": null
             },
-            "total_tokens": 7825,
+            "total_tokens": 12439,
             "cost": null
           },
           "user": null,
@@ -921,7 +945,7 @@
           "billing": {
             "payer": "developer"
           },
-          "completed_at": 1768459227,
+          "completed_at": 1768469864,
           "frequency_penalty": 0.0,
           "max_tool_calls": null,
           "presence_penalty": 0.0,
@@ -935,8 +959,380 @@
     },
     {
       "role": "user",
-      "content": "diff --git a/django/db/models/query.py b/django/db/models/query.py\nindex d9c9b0db04..a780a6ca20 100644\n--- a/django/db/models/query.py\n+++ b/django/db/models/query.py\n@@ -15,7 +15,7 @@ from django.db import (\n     DJANGO_VERSION_PICKLE_KEY, IntegrityError, NotSupportedError, connections,\n     router, transaction,\n )\n-from django.db.models import AutoField, DateField, DateTimeField, sql\n+from django.db.models import AutoField, DateField, DateTimeField, UniqueConstraint, sql\n from django.db.models.constants import LOOKUP_SEP\n from django.db.models.deletion import Collector\n from django.db.models.expressions import Case, Expression, F, Value, When\n@@ -689,8 +689,15 @@ class QuerySet:\n         \"\"\"\n         assert not self.query.is_sliced, \\\n             \"Cannot use 'limit' or 'offset' with in_bulk\"\n-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n-            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+        if field_name != 'pk':\n+            field = self.model._meta.get_field(field_name)\n+            if not field.unique:\n+                # The field may be unique due to a UniqueConstraint in the model's Meta.constraints.\n+                for constraint in getattr(self.model._meta, 'constraints', ()): \n+                    if isinstance(constraint, UniqueConstraint) and list(getattr(constraint, 'fields', [])) == [field_name]:\n+                        break\n+                else:\n+                    raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n         if id_list is not None:\n             if not id_list:\n                 return {}\ndiff --git a/test_app/__init__.py b/test_app/__init__.py\nnew file mode 100644\nindex 0000000000..88bb5df0fc\n--- /dev/null\n+++ b/test_app/__init__.py\n@@ -0,0 +1 @@\n+default_app_config = 'test_app.apps.TestAppConfig'\ndiff --git a/test_app/apps.py b/test_app/apps.py\nnew file mode 100644\nindex 0000000000..05dd1f6e21\n--- /dev/null\n+++ b/test_app/apps.py\n@@ -0,0 +1,5 @@\n+from django.apps import AppConfig\n+\n+class TestAppConfig(AppConfig):\n+    name = 'test_app'\n+    label = 'test_app'\ndiff --git a/test_in_bulk.py b/test_in_bulk.py\nnew file mode 100644\nindex 0000000000..1e47097b7c\n--- /dev/null\n+++ b/test_in_bulk.py\n@@ -0,0 +1,38 @@\n+import os\n+import django\n+from django.conf import settings\n+from django.db import models\n+\n+BASE_DIR = os.path.dirname(__file__)\n+if not settings.configured:\n+    settings.configure(\n+        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n+        INSTALLED_APPS=['test_app'],\n+        SECRET_KEY='test',\n+    )\n+\n+# Create a minimal app config\n+import types\n+apps = types.SimpleNamespace()\n+django.setup()\n+\n+class Article(models.Model):\n+    slug = models.CharField(max_length=255)\n+\n+    class Meta:\n+        app_label = 'test_app'\n+        constraints = [\n+            models.UniqueConstraint(fields=['slug'], name='testapp_article_slug_unq')\n+        ]\n+\n+# Create tables\n+from django.db import connection\n+with connection.schema_editor() as editor:\n+    editor.create_model(Article)\n+\n+# Create some objects\n+Article.objects.create(slug='a')\n+Article.objects.create(slug='b')\n+\n+# Call in_bulk by slug\n+print(Article.objects.in_bulk(field_name='slug'))\n",
-      "timestamp": 1768459228.4840891
+      "content": "Please always provide EXACTLY ONE action in triple backticks, found 0 actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).",
+      "timestamp": 1768469864.8551393
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I'll patch django/db/models/query.py to treat a field as unique if there's an unconditional UniqueConstraint on that single field. I'll run a Python one-liner script that finds the existing uniqueness check and replaces it with logic that also inspects model._meta.constraints for a matching UniqueConstraint.\n\n```bash\npython - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/query.py')\ns = p.read_text()\nold = \"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\\n            raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\"\nif old in s:\n    new = (\n        \"        if field_name != 'pk':\\n\"\n        \"            field = self.model._meta.get_field(field_name)\\n\"\n        \"            is_unique = field.unique\\n\"\n        \"            # Consider a field unique if there's an unconditional UniqueConstraint on it.\\n\"\n        \"            if not is_unique:\\n\"\n        \"                try:\\n\"\n        \"                    from django.db.models import UniqueConstraint\\n\"\n        \"                except Exception:\\n\"\n        \"                    UniqueConstraint = None\\n\"\n        \"                if UniqueConstraint is not None:\\n\"\n        \"                    for constraint in self.model._meta.constraints:\\n\"\n        \"                        if isinstance(constraint, UniqueConstraint) and constraint.condition is None and tuple(constraint.fields) == (field_name,):\\n\"\n        \"                            is_unique = True\\n\"\n        \"                            break\\n\"\n        \"            if not is_unique:\\n\"\n        \"                raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\"\n    )\n    s = s.replace(old, new)\n    p.write_text(s)\n    print('patched django/db/models/query.py')\nelse:\n    print('pattern not found, no changes made')\nPY\n```",
+      "timestamp": 1768469872.855639,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NjhkYmE4ODE5NmJlNWI1MWQwMTllMzM1MDk=",
+          "created_at": 1768469865,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_049e3d1940643cf9006968b56991b0819693902af27d7c1814",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_049e3d1940643cf9006968b56a86388196a64c602b1ac03453",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "THOUGHT: I'll patch django/db/models/query.py to treat a field as unique if there's an unconditional UniqueConstraint on that single field. I'll run a Python one-liner script that finds the existing uniqueness check and replaces it with logic that also inspects model._meta.constraints for a matching UniqueConstraint.\n\n```bash\npython - <<'PY'\nfrom pathlib import Path\np = Path('django/db/models/query.py')\ns = p.read_text()\nold = \"        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\\n            raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\"\nif old in s:\n    new = (\n        \"        if field_name != 'pk':\\n\"\n        \"            field = self.model._meta.get_field(field_name)\\n\"\n        \"            is_unique = field.unique\\n\"\n        \"            # Consider a field unique if there's an unconditional UniqueConstraint on it.\\n\"\n        \"            if not is_unique:\\n\"\n        \"                try:\\n\"\n        \"                    from django.db.models import UniqueConstraint\\n\"\n        \"                except Exception:\\n\"\n        \"                    UniqueConstraint = None\\n\"\n        \"                if UniqueConstraint is not None:\\n\"\n        \"                    for constraint in self.model._meta.constraints:\\n\"\n        \"                        if isinstance(constraint, UniqueConstraint) and constraint.condition is None and tuple(constraint.fields) == (field_name,):\\n\"\n        \"                            is_unique = True\\n\"\n        \"                            break\\n\"\n        \"            if not is_unique:\\n\"\n        \"                raise ValueError(\\\"in_bulk()'s field_name must be a unique field but %r isn't.\\\" % field_name)\"\n    )\n    s = s.replace(old, new)\n    p.write_text(s)\n    print('patched django/db/models/query.py')\nelse:\n    print('pattern not found, no changes made')\nPY\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_049e3d1940643cf9006968b5608e548196869d810b95c23b16",
+          "reasoning": {
+            "effort": "low",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 12475,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 11136,
+              "text_tokens": null
+            },
+            "output_tokens": 478,
+            "output_tokens_details": {
+              "reasoning_tokens": 64,
+              "text_tokens": null
+            },
+            "total_tokens": 12953,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768469872,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\npatched django/db/models/query.py\n</output>",
+      "timestamp": 1768469873.0538876
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Run the specific lookup tests for in_bulk to verify the change, focusing on test_in_bulk_with_field and test_in_bulk_non_unique_field.\n\n```bash\npytest -q tests/lookup/tests.py::LookupTests::test_in_bulk_with_field tests/lookup/tests.py::LookupTests::test_in_bulk_non_unique_field -q\n```",
+      "timestamp": 1768469875.848307,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NzEwMzUwODE5NjhiYzRiZDI3MWQzYjM0MWY=",
+          "created_at": 1768469873,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_049e3d1940643cf9006968b571a43c81968c75813ddd657a9d",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_049e3d1940643cf9006968b572922c81968bdcfec1e9bd727f",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "THOUGHT: Run the specific lookup tests for in_bulk to verify the change, focusing on test_in_bulk_with_field and test_in_bulk_non_unique_field.\n\n```bash\npytest -q tests/lookup/tests.py::LookupTests::test_in_bulk_with_field tests/lookup/tests.py::LookupTests::test_in_bulk_non_unique_field -q\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_049e3d1940643cf9006968b568dba88196be5b51d019e33509",
+          "reasoning": {
+            "effort": "low",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 12915,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 12160,
+              "text_tokens": null
+            },
+            "output_tokens": 141,
+            "output_tokens_details": {
+              "reasoning_tokens": 64,
+              "text_tokens": null
+            },
+            "total_tokens": 13056,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768469875,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>4</returncode>\n<output>\nERROR: not found: /testbed/tests/lookup/tests.py::LookupTests::test_in_bulk_with_field\n(no name '/testbed/tests/lookup/tests.py::LookupTests::test_in_bulk_with_field' in any of [<Module tests.py>])\n\nERROR: not found: /testbed/tests/lookup/tests.py::LookupTests::test_in_bulk_non_unique_field\n(no name '/testbed/tests/lookup/tests.py::LookupTests::test_in_bulk_non_unique_field' in any of [<Module tests.py>])\n\n\n==================================== ERRORS ====================================\n____________________ ERROR collecting tests/lookup/tests.py ____________________\ntests/lookup/tests.py:13: in <module>\n    from .models import (\ntests/lookup/models.py:11: in <module>\n    class Alarm(models.Model):\ndjango/db/models/base.py:108: in __new__\n    app_config = apps.get_containing_app_config(module)\ndjango/apps/registry.py:252: in get_containing_app_config\n    self.check_apps_ready()\ndjango/apps/registry.py:134: in check_apps_ready\n    settings.INSTALLED_APPS\ndjango/conf/__init__.py:77: in __getattr__\n    self._setup(name)\ndjango/conf/__init__.py:62: in _setup\n    % (desc, ENVIRONMENT_VARIABLE))\nE   django.core.exceptions.ImproperlyConfigured: Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.\n____________________ ERROR collecting tests/lookup/tests.py ____________________\ntests/lookup/tests.py:13: in <module>\n    from .models import (\ntests/lookup/models.py:11: in <module>\n    class Alarm(models.Model):\ndjango/db/models/base.py:108: in __new__\n    app_config = apps.get_containing_app_config(module)\ndjango/apps/registry.py:252: in get_containing_app_config\n    self.check_apps_ready()\ndjango/apps/registry.py:134: in check_apps_ready\n    settings.INSTALLED_APPS\ndjango/conf/__init__.py:77: in __getattr__\n    self._setup(name)\ndjango/conf/__init__.py:62: in _setup\n    % (desc, ENVIRONMENT_VARIABLE))\nE   django.core.exceptions.ImproperlyConfigured: Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.\n=========================== short test summary info ============================\nERROR tests/lookup/tests.py - django.core.exceptions.ImproperlyConfigured: Re...\nERROR tests/lookup/tests.py - django.core.exceptions.ImproperlyConfigured: Re...\n</output>",
+      "timestamp": 1768469876.4747124
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Running pytest directly failed because Django settings aren't configured. I'll run a small Python script that configures minimal Django settings, defines a test model with a UniqueConstraint on 'slug', and demonstrates that QuerySet.in_bulk accepts field_name='slug' without raising. This verifies the patch without running the full test suite.\n\n```bash\npython - <<'PY'\nimport django\nfrom django.conf import settings\nfrom django.db import models, connections\n# Minimal settings\nsettings.configure(\n    INSTALLED_APPS=['django.contrib.contenttypes'],\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n)\ndjango.setup()\nfrom django.db import connection\n# Define a temporary model\nclass Article(models.Model):\n    slug = models.CharField(max_length=255)\n    class Meta:\n        app_label = 'tests'\n        constraints = [models.UniqueConstraint(fields=['slug'], name='tests_article_slug_unq')]\n# Create table\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(Article)\n# Create instances\nArticle.objects.create(slug='a')\nArticle.objects.create(slug='b')\n# Call in_bulk with field_name='slug'\nres = Article.objects.in_bulk([ 'a', 'b' ], field_name='slug')\nprint('in_bulk returned keys:', sorted(res.keys()))\nPY\n```",
+      "timestamp": 1768469881.6176605,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NzQ2ZDVjODE5NmE5MTQ4MDU5ZjJlOWI4NWE=",
+          "created_at": 1768469876,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "rs_049e3d1940643cf9006968b5751dc08196aa2ab495ee964d91",
+              "summary": [],
+              "type": "reasoning",
+              "content": null,
+              "encrypted_content": null,
+              "status": null
+            },
+            {
+              "id": "msg_049e3d1940643cf9006968b5761a688196bec1685f18707082",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "THOUGHT: Running pytest directly failed because Django settings aren't configured. I'll run a small Python script that configures minimal Django settings, defines a test model with a UniqueConstraint on 'slug', and demonstrates that QuerySet.in_bulk accepts field_name='slug' without raising. This verifies the patch without running the full test suite.\n\n```bash\npython - <<'PY'\nimport django\nfrom django.conf import settings\nfrom django.db import models, connections\n# Minimal settings\nsettings.configure(\n    INSTALLED_APPS=['django.contrib.contenttypes'],\n    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},\n)\ndjango.setup()\nfrom django.db import connection\n# Define a temporary model\nclass Article(models.Model):\n    slug = models.CharField(max_length=255)\n    class Meta:\n        app_label = 'tests'\n        constraints = [models.UniqueConstraint(fields=['slug'], name='tests_article_slug_unq')]\n# Create table\nwith connection.schema_editor() as schema_editor:\n    schema_editor.create_model(Article)\n# Create instances\nArticle.objects.create(slug='a')\nArticle.objects.create(slug='b')\n# Call in_bulk with field_name='slug'\nres = Article.objects.in_bulk([ 'a', 'b' ], field_name='slug')\nprint('in_bulk returned keys:', sorted(res.keys()))\nPY\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_049e3d1940643cf9006968b571035081968bc4bd271d3b341f",
+          "reasoning": {
+            "effort": "low",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 13564,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 12800,
+              "text_tokens": null
+            },
+            "output_tokens": 349,
+            "output_tokens_details": {
+              "reasoning_tokens": 64,
+              "text_tokens": null
+            },
+            "total_tokens": 13913,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768469881,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<returncode>0</returncode>\n<output>\nin_bulk returned keys: ['a', 'b']\n</output>",
+      "timestamp": 1768469882.0279255
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I've verified the fix locally. Now I'll stage the changes and show the git diff of the staged changes as required for submission.\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
+      "timestamp": 1768469883.8132975,
+      "extra": {
+        "response": {
+          "id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2RlbF9pZDpOb25lO3Jlc3BvbnNlX2lkOnJlc3BfMDQ5ZTNkMTk0MDY0M2NmOTAwNjk2OGI1NzlmYTI0ODE5NjgwODVmZjZiYzcxNzg3MGM=",
+          "created_at": 1768469882,
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "metadata": {},
+          "model": "gpt-5-mini-2025-08-07",
+          "object": "response",
+          "output": [
+            {
+              "id": "msg_049e3d1940643cf9006968b57ac2b88196a3ea25484d362c94",
+              "content": [
+                {
+                  "annotations": [],
+                  "text": "THOUGHT: I've verified the fix locally. Now I'll stage the changes and show the git diff of the staged changes as required for submission.\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
+                  "type": "output_text",
+                  "logprobs": []
+                }
+              ],
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "temperature": 1.0,
+          "tool_choice": "auto",
+          "tools": [],
+          "top_p": 1.0,
+          "max_output_tokens": null,
+          "previous_response_id": "resp_049e3d1940643cf9006968b5746d5c8196a9148059f2e9b85a",
+          "reasoning": {
+            "effort": "low",
+            "summary": null
+          },
+          "status": "completed",
+          "text": {
+            "format": {
+              "type": "text"
+            },
+            "verbosity": "medium"
+          },
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 13879,
+            "input_tokens_details": {
+              "audio_tokens": null,
+              "cached_tokens": 13056,
+              "text_tokens": null
+            },
+            "output_tokens": 56,
+            "output_tokens_details": {
+              "reasoning_tokens": 0,
+              "text_tokens": null
+            },
+            "total_tokens": 13935,
+            "cost": null
+          },
+          "user": null,
+          "store": true,
+          "background": false,
+          "billing": {
+            "payer": "developer"
+          },
+          "completed_at": 1768469883,
+          "frequency_penalty": 0.0,
+          "max_tool_calls": null,
+          "presence_penalty": 0.0,
+          "prompt_cache_key": null,
+          "prompt_cache_retention": null,
+          "safety_identifier": null,
+          "service_tier": "default",
+          "top_logprobs": 0
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "diff --git a/django/db/models/query.py b/django/db/models/query.py\nindex d9c9b0db04..16cb10cf64 100644\n--- a/django/db/models/query.py\n+++ b/django/db/models/query.py\n@@ -689,8 +689,22 @@ class QuerySet:\n         \"\"\"\n         assert not self.query.is_sliced, \\\n             \"Cannot use 'limit' or 'offset' with in_bulk\"\n-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:\n-            raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n+        if field_name != 'pk':\n+            field = self.model._meta.get_field(field_name)\n+            is_unique = field.unique\n+            # Consider a field unique if there's an unconditional UniqueConstraint on it.\n+            if not is_unique:\n+                try:\n+                    from django.db.models import UniqueConstraint\n+                except Exception:\n+                    UniqueConstraint = None\n+                if UniqueConstraint is not None:\n+                    for constraint in self.model._meta.constraints:\n+                        if isinstance(constraint, UniqueConstraint) and constraint.condition is None and tuple(constraint.fields) == (field_name,):\n+                            is_unique = True\n+                            break\n+            if not is_unique:\n+                raise ValueError(\"in_bulk()'s field_name must be a unique field but %r isn't.\" % field_name)\n         if id_list is not None:\n             if not id_list:\n                 return {}\n",
+      "timestamp": 1768469884.227793
     }
   ],
   "trajectory_format": "mini-swe-agent-1",
