@@ -326,7 +326,7 @@ Remember: High reasoning consumes more resources, so only request it when truly 
 ## Root Cause Analysis Protocol
 Your first objective is to conduct a thorough root cause analysis of the bug. During this analysis phase, you will have enhanced reasoning capabilities to help you deeply understand the issue.
 
-**IMPORTANT:** Once you have identified the root cause of the bug, you MUST output the following exact phrase in your "Thoughts:" output:
+**IMPORTANT:** Once you have identified the root cause of the bug, you MUST output the following exact phrase in your "THOUGHT" output:
 
 **"{self.root_cause_trigger_phrase}"** 
 
@@ -399,9 +399,7 @@ Your request for high reasoning has been received. The next model call will use 
 <root_cause_acknowledgment>
 Excellent! You have identified the root cause of the issue. The system has noted your analysis.
 
-Root cause trigger detected: "{self.root_cause_trigger_phrase}"
-
-You may now proceed with implementing the fix. The system will optimize for efficient execution during the implementation phase.
+You may now proceed with implementing the fix and patch verification.
 </root_cause_acknowledgment>
 """
                         self.add_message("user", acknowledgment)
