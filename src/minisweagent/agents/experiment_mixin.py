@@ -12,7 +12,7 @@ class ExperimentMixin:
                  reasoning_strategy: str = None,
                  high_reasoning_first_round: int = 3,
                  routine_high_reasoning_interval: int = 5,
-                 root_cause_trigger_phrase: str = "I see the issue!",
+                 root_cause_trigger_phrase: str = "START_PATCH_GENERATION_STAGE",
                  **kwargs):
         """
         Initialize the reasoning strategy mixin.
@@ -322,15 +322,12 @@ Remember: High reasoning consumes more resources, so only request it when truly 
             return ""
 
         instruction = f"""
+**IMPORTANT:** When you have already have the detailed fix plan and is about to start the patch generation, you MUST execute the following bash command:
 
-## Root Cause Analysis Protocol
-Your first objective is to conduct a thorough root cause analysis of the bug. During this analysis phase, you will have enhanced reasoning capabilities to help you deeply understand the issue.
-
-**IMPORTANT:** Once you have identified the root cause of the bug, you MUST output the following exact phrase in your "THOUGHT" output:
-
-**"{self.root_cause_trigger_phrase}"** 
-
-Remember: Thorough understanding now will lead to better fixes later."""
+```bash
+echo "{self.root_cause_trigger_phrase}" 
+```
+"""
 
         return instruction
 
@@ -397,9 +394,7 @@ Your request for high reasoning has been received. The next model call will use 
                         # Add acknowledgment message
                         acknowledgment = f"""
 <root_cause_acknowledgment>
-Excellent! You have identified the root cause of the issue. The system has noted your analysis.
-
-You may now proceed with implementing the fix and patch verification.
+Excellent! You may now proceed with implementing the fix and patch verification.
 </root_cause_acknowledgment>
 """
                         self.add_message("user", acknowledgment)
