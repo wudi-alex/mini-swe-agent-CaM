@@ -12,23 +12,28 @@ class ExperimentMixin:
                  reasoning_strategy: str = None,
                  high_reasoning_first_round: int = 3,
                  routine_high_reasoning_interval: int = 5,
+                 root_cause_trigger_phrase: str = "I see the issue!",
                  **kwargs):
         """
         Initialize the reasoning strategy mixin.
 
         Args:
             reasoning_strategy: Strategy type - "first_high_reasoning", "routine_high_reasoning",
-                              "ask_for_high_reasoning", or None to disable
+                              "ask_for_high_reasoning", "root_cause_high_reasoning", or None to disable
             high_reasoning_first_round: Number of first rounds to use high reasoning
                                       (for first_high_reasoning strategy)
             routine_high_reasoning_interval: Interval for routine high reasoning
                                            (for routine_high_reasoning strategy)
+            root_cause_trigger_phrase: Phrase that indicates root cause analysis is complete
+                                      (for root_cause_high_reasoning strategy)
         """
         self.reasoning_strategy = reasoning_strategy
         self.high_reasoning_first_round = high_reasoning_first_round
         self.routine_high_reasoning_interval = routine_high_reasoning_interval
+        self.root_cause_trigger_phrase = root_cause_trigger_phrase
         self.next_call_use_high = False  # Flag for ask_for_high_reasoning strategy
         self.routine_reflection_count = 0  # Counter for routine reflections
+        self.root_cause_found = False  # Flag for root_cause_high_reasoning strategy
         self._reasoning_initialized = False  # Track if we've initialized reasoning support
 
         print(f"[ExperimentMixin] Initialized with strategy: {reasoning_strategy}")
@@ -38,6 +43,9 @@ class ExperimentMixin:
             print(f"[ExperimentMixin] Will use high reasoning every {routine_high_reasoning_interval} rounds")
         elif reasoning_strategy == "ask_for_high_reasoning":
             print(f"[ExperimentMixin] Will use high reasoning when explicitly requested by agent")
+        elif reasoning_strategy == "root_cause_high_reasoning":
+            print(f"[ExperimentMixin] Will use high reasoning until root cause found")
+            print(f"[ExperimentMixin] Trigger phrase: '{root_cause_trigger_phrase}'")
 
         # Call parent initialization (supports multiple inheritance)
         super().__init__(*args, **kwargs)
@@ -179,6 +187,30 @@ class ExperimentMixin:
 
         return False
 
+    def check_root_cause_found(self, response: str) -> bool:
+        """
+        Check if agent's response indicates root cause has been found.
+
+        Args:
+            response: Agent's text response from the model
+
+        Returns:
+            True if root cause trigger phrase was found
+        """
+        if self.reasoning_strategy != "root_cause_high_reasoning":
+            return False
+
+        # If already found, no need to check again
+        if self.root_cause_found:
+            return False
+
+        # Check if trigger phrase is in the agent's response
+        if self.root_cause_trigger_phrase in response:
+            print(f"[ExperimentMixin] Root cause trigger detected: '{self.root_cause_trigger_phrase}'")
+            return True
+
+        return False
+
     def prepare_for_next_call(self):
         """Prepare reasoning effort for the next model call based on active strategy."""
 
@@ -204,6 +236,21 @@ class ExperimentMixin:
                 current_effort = self.get_current_reasoning_effort()
                 if current_effort != "low":
                     self.set_reasoning_effort("low")
+
+        # Strategy 4: root_cause_high_reasoning
+        elif self.reasoning_strategy == "root_cause_high_reasoning":
+            if not self.root_cause_found:
+                # Still looking for root cause, use high reasoning
+                current_effort = self.get_current_reasoning_effort()
+                if current_effort != "high":
+                    self.set_reasoning_effort("high")
+                    print(f"[ExperimentMixin] Using high reasoning (searching for root cause)")
+            else:
+                # Root cause found, switch to low reasoning
+                current_effort = self.get_current_reasoning_effort()
+                if current_effort != "low":
+                    self.set_reasoning_effort("low")
+                    print(f"[ExperimentMixin] Using low reasoning (root cause found)")
 
     def inject_routine_reflection(self):
         """Inject a reflection prompt for routine high reasoning strategy."""
@@ -264,8 +311,31 @@ Remember: High reasoning consumes more resources, so only request it when truly 
 
         return instruction
 
+    def get_root_cause_instruction(self) -> str:
+        """
+        Get instruction text for root cause analysis (for root_cause_high_reasoning strategy).
+
+        Returns:
+            Instruction text to append to task description
+        """
+        if self.reasoning_strategy != "root_cause_high_reasoning":
+            return ""
+
+        instruction = f"""
+
+## Root Cause Analysis Protocol
+Your first objective is to conduct a thorough root cause analysis of the bug. During this analysis phase, you will have enhanced reasoning capabilities to help you deeply understand the issue.
+
+**IMPORTANT:** Once you have identified the root cause of the bug, you MUST output the following exact phrase in your "Thoughts:" output:
+
+**"{self.root_cause_trigger_phrase}"** 
+
+Remember: Thorough understanding now will lead to better fixes later."""
+
+        return instruction
+
     def execute_action(self, action: dict) -> dict:
-        """Override execute_action to handle ask_for_high_reasoning strategy."""
+        """Override execute_action to handle strategy-specific checks."""
 
         # Call parent's execute_action
         output = super().execute_action(action)
@@ -300,11 +370,47 @@ Your request for high reasoning has been received. The next model call will use 
             # Note: After reflection message is added, parent's step() will be called
             # which will trigger a model call with high reasoning
 
-        # Prepare reasoning effort for the next call (for strategies 1 and 3)
+        # Prepare reasoning effort for the next call (for all strategies)
         self.prepare_for_next_call()
 
-        # Call parent's step
+        # Call parent's step (which calls query() and get_observation())
+        # query() will add the assistant message to self.messages
         result = super().step()
+
+        # Strategy 4: Check if root cause has been found (in agent's response)
+        # The agent's response was just added to self.messages by query()
+        if self.reasoning_strategy == "root_cause_high_reasoning" and not self.root_cause_found:
+            # Get the most recent assistant message (just added by query())
+            for msg in reversed(self.messages):
+                if msg.get("role") == "assistant":
+                    response_content = msg.get("content", "")
+
+                    # Check if trigger phrase is in the response
+                    if self.check_root_cause_found(response_content):
+                        print("="*80)
+                        print("[ExperimentMixin] Root Cause Found!")
+                        print("="*80)
+
+                        # Mark root cause as found
+                        self.root_cause_found = True
+
+                        # Add acknowledgment message
+                        acknowledgment = f"""
+<root_cause_acknowledgment>
+Excellent! You have identified the root cause of the issue. The system has noted your analysis.
+
+Root cause trigger detected: "{self.root_cause_trigger_phrase}"
+
+You may now proceed with implementing the fix. The system will optimize for efficient execution during the implementation phase.
+</root_cause_acknowledgment>
+"""
+                        self.add_message("user", acknowledgment)
+                        print(f"[ExperimentMixin] Root cause marked as found")
+                        print(f"[ExperimentMixin] Will switch to low reasoning for implementation")
+                        print("="*80)
+
+                    # Only check the most recent assistant message
+                    break
 
         # After the step, if we used high reasoning for routine strategy, reset to low
         if self.reasoning_strategy == "routine_high_reasoning":
@@ -339,13 +445,23 @@ Your request for high reasoning has been received. The next model call will use 
             # Start with low reasoning (will be changed as needed)
             self.set_reasoning_effort("low")
             print(f"[ExperimentMixin] Starting with low reasoning")
+        elif self.reasoning_strategy == "root_cause_high_reasoning":
+            # Start with high reasoning for root cause analysis
+            self.set_reasoning_effort("high")
+            print(f"[ExperimentMixin] Starting with high reasoning for root cause analysis")
+            print(f"[ExperimentMixin] Will switch to low after detecting: '{self.root_cause_trigger_phrase}'")
 
-        # For ask_for_high_reasoning strategy, append instruction to task
+        # Append strategy-specific instructions to task
         if self.reasoning_strategy == "ask_for_high_reasoning":
             high_reasoning_instruction = self.get_high_reasoning_instruction()
             if high_reasoning_instruction:
                 task = task + high_reasoning_instruction
                 print(f"[ExperimentMixin] Appended high reasoning instruction to task")
+        elif self.reasoning_strategy == "root_cause_high_reasoning":
+            root_cause_instruction = self.get_root_cause_instruction()
+            if root_cause_instruction:
+                task = task + root_cause_instruction
+                print(f"[ExperimentMixin] Appended root cause analysis instruction to task")
 
         print("="*80)
 
