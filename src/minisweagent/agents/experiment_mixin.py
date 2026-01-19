@@ -11,7 +11,7 @@ class ExperimentMixin:
     def __init__(self, *args,
                  reasoning_strategy: str = None,
                  high_reasoning_first_round: int = 3,
-                 routine_high_reasoning_interval: int = 5,
+                 routine_high_reasoning_interval: int = 6,
                  root_cause_trigger_phrase: str = "START_PATCH_GENERATION_STAGE",
                  **kwargs):
         """
@@ -267,6 +267,7 @@ This is a routine checkpoint (every {self.routine_high_reasoning_interval} steps
 5. **Course correction**: If you're stuck or going in the wrong direction, what should you change?
 
 Think deeply about your trajectory and make any necessary corrections before proceeding.
+Summary your reasoning in the 'THOUGHT'.
 </routine_reflection>
 """
 
@@ -295,19 +296,11 @@ Think deeply about your trajectory and make any necessary corrections before pro
         instruction = """
 
 ## High Reasoning Request
-When you encounter a particularly challenging problem that requires deep analysis, careful planning, or complex reasoning, you can request enhanced reasoning capabilities. To do this, use the following bash command:
+Everytime when you think the requirement deep analysis, careful planning when doing the task, or complex reasoning, you MUST request enhanced reasoning capabilities. To do this, use the following bash command:
 
 ```bash
 echo "ASK_FOR_HIGH_REASONING"
-```
-
-After executing this command, your next response will be generated with high reasoning effort, allowing for more thorough analysis and better problem-solving. Use this judiciously when you:
-- Need to analyze complex code interactions
-- Are stuck and need to reconsider your approach
-- Need to plan a multi-step solution carefully
-- Are about to make critical changes that require careful thought
-
-Remember: High reasoning consumes more resources, so only request it when truly necessary."""
+```"""
 
         return instruction
 
